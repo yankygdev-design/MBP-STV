@@ -44,6 +44,7 @@
     siteRe: /(^|\.)movieboxpro\./i,
     siteAdapters: true,     // use the per-site hints below (tiles, episode changing, player teardown)
     hiddenScroll: true,     // treat overflow:hidden rows that overflow as scrollable (jQuery carousels)
+    pageScale: true,        // lift the site's 750px cap so its own rem layout fills a TV screen
     quick: [
       { label: 'Home', url: '/' },
       { label: 'Search', action: 'search' },
@@ -1834,7 +1835,56 @@
     clearTimeout(toastTimer);
     toastTimer = setTimeout(function () { ui.toast.style.display = 'none'; }, ms || 2400);
   }
+  // ------------------------------------------------------------------ page scale
+  // The catalogue is a 750px-wide phone design. The site's own index.js does
+  //     var w = window.innerWidth; if (w > 750) { w = 750 }
+  //     html.style.fontSize = w / 7.5 + 'px'
+  // so every rem in its stylesheet is pinned to a 750px canvas. On a 1920 set the page
+  // renders 750px wide - under 40% of the screen - which is what "everything is tiny"
+  // means on a TV. Lifting the cap drives the site's own mechanism, so the layout scales
+  // the way its author already intended at narrower widths rather than by our guesswork.
+  //
+  // Written as an !important rule rather than onto html.style, because the site re-applies
+  // its own inline value on every resize and an !important stylesheet rule still beats it.
+  //
+  // CSS zoom was the obvious one-liner and is wrong here. Measured on this site: under zoom
+  // getBoundingClientRect keeps reporting unzoomed coordinates while elementFromPoint wants
+  // visual pixels, so the hit test behind every synthetic click in this file comes back null
+  // and nothing on the page can be activated. Do not swap this for zoom.
+  //
+  // Scaling by width scales height with it, so a layout built to fill one phone screen ends
+  // up taller than a TV screen and has to be scrolled. That is inherent in honouring a
+  // portrait design on a landscape panel rather than a fault here, and it is the reason this
+  // is adjustable at all: Red, then Screen size, then Left and Right.
+  var SCALE_KEY = 'mbtv_scale', SCALE_MIN = 0.4, SCALE_MAX = 1.4, scaleEl = null;
+  function scaleClamp(v) { return Math.max(SCALE_MIN, Math.min(SCALE_MAX, Math.round(v * 20) / 20)); }
+  function scaleGet() {
+    var v = NaN;
+    try { v = parseFloat(W.localStorage.getItem(SCALE_KEY)); } catch (e) {}
+    return scaleClamp(v > 0 ? v : 1);          // 1 means the design filling the screen width
+  }
+  function scaleApply() {
+    if (!CFG.pageScale || !onSite()) return;
+    var px = (W.innerWidth / 7.5) * scaleGet();
+    if (!(px > 0)) return;                     // a zero-width viewport: leave the site alone
+    if (!attached(scaleEl)) {
+      scaleEl = D.createElement('style');
+      scaleEl.setAttribute('data-mbtv', 'scale');
+      (D.head || D.documentElement).appendChild(scaleEl);
+    }
+    var want = 'html{font-size:' + px.toFixed(2) + 'px !important;}';
+    if (scaleEl.textContent !== want) { scaleEl.textContent = want; markDirty(); }
+  }
+  function scaleNudge(dir) {
+    var v = scaleClamp(scaleGet() + dir * 0.1);
+    try { W.localStorage.setItem(SCALE_KEY, String(v)); } catch (e) {}
+    scaleApply();
+    return v;
+  }
+  function scaleLabel() { return 'Screen size  ' + Math.round(scaleGet() * 100) + '%   \u25c0 \u25b6'; }
+
   function openPanel(title, items, kind, html) {
+
     panel = { title: title, items: items || [], idx: 0, kind: kind, html: html || '' };
     for (var i = 0; i < panel.items.length; i++) if (panel.items[i].selected) panel.idx = i;
     renderPanel();
@@ -1870,6 +1920,11 @@
         closePanel();
         if (it && it.run) it.run();
         return true;
+      case K.LEFT: case K.RIGHT:
+        // a row that can be adjusted in place keeps the panel open; everything else swallows
+        var row = panel.items[panel.idx];
+        if (row && row.step) row.step(code === K.RIGHT ? 1 : -1);
+        return true;
       case K.BACK: case K.RED: closePanel(); return true;
     }
     return true;
@@ -1880,6 +1935,10 @@
       if (!site && q.action) return;
       items.push({ label: q.label, run: function () { if (q.action === 'search') focusSearch(); else goTo(q.url); } });
     })(CFG.quick[i]);
+    if (site && CFG.pageScale) items.push({ label: scaleLabel(), step: function (d) {
+      scaleNudge(d);
+      if (panel && panel.items[panel.idx]) { panel.items[panel.idx].label = scaleLabel(); renderPanel(); }
+    } });
     items.push({ label: 'Remote help', run: showHelp });
     items.push({ label: 'Exit', run: exitApp });
     openPanel(atRoot ? 'Nothing more to go back to' : 'Menu', items, 'menu');
@@ -1897,7 +1956,7 @@
     var browse = '<h3>Browsing</h3>' +
       '<div class=\"mbtv-row\"><b>\u25c0 \u25b2 \u25bc \u25b6, OK</b><span>Move and select</span></div>' +
       '<div class=\"mbtv-row\"><b>Back</b><span>Go back or close a popup</span></div>' +
-      '<div class=\"mbtv-row\"><b>Red</b><span>Menu (home, history, favorites, sign in)</span></div>' +
+      '<div class=\"mbtv-row\"><b>Red</b><span>Menu (home, history, favorites, sign in, screen size)</span></div>' +
       '<div class=\"mbtv-row\"><b>Green / Yellow</b><span>Search / History</span></div>' +
       '<div class=\"mbtv-row\"><b>CH+ / CH\u2212</b><span>Page up / down</span></div>' +
       '<div class=\"mbtv-row\"><b>Blue or Info</b><span>This help</span></div>';
@@ -1940,13 +1999,14 @@
   function start() {
     if (!D.body) { setTimeout(start, 50); return; }
     site = pickSite();
+    scaleApply();      // before the first focus, so the ring is drawn against the final layout
     buildUI();
     W.addEventListener('keydown', onKeyDown, true);
     W.addEventListener('keyup', onKeyOther, true);
     W.addEventListener('keypress', onKeyOther, true);
     W.addEventListener('message', onMessage, false);
     W.addEventListener('scroll', drawRingSoon, true);
-    W.addEventListener('resize', function () { markDirty(); drawRingSoon(); }, false);
+    W.addEventListener('resize', function () { markDirty(); drawRingSoon(); scaleApply(); }, false);
     D.addEventListener('fullscreenchange', onFSChange, false);
     D.addEventListener('webkitfullscreenchange', onFSChange, false);
     D.addEventListener('playing', onPlaying, true);
@@ -1973,7 +2033,7 @@
       mode = 'idle';
     }
     W.__mbtv = {
-      version: '1.1.0', cfg: CFG, sites: SITES,
+      version: '1.2.0', cfg: CFG, sites: SITES,
       state: function () {
         return { mode: mode, site: site ? site.name : null, focus: focusEl, traps: traps.length,
           video: video, box: box, panel: panel ? panel.kind : null, cands: candidates(currentScope()).length };
