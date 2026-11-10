@@ -54,7 +54,8 @@
       { label: 'History', url: '/index/index/history' },
       { label: 'Favorites', url: '/index/index/fav_list' },
       { label: 'My lists', url: '/index/playlist?type=mine' },
-      { label: 'Sign in with a code', url: '/index/index/tv_login' }
+      { label: 'Sign in with a code', url: '/index/login/code_login' },
+      { label: 'Sign in with a QR code', url: '/index/login/qrcode' }
     ],
     debug: false
   };
@@ -139,7 +140,12 @@
       // chips that clear one active filter - all images and paragraphs with jQuery handlers
       '.more,.tab_watched,.watch_status,.operation_list p,.create_list,.manage_lists,' +
       '#clear_filter,.clear_type,.clear_sort,.clear_rating,.clear_quality,.clear_year,' +
-      '.clear_genr,.clear_genre,.clear_country,.clear_tomatometer',
+      '.clear_genr,.clear_genre,.clear_country,.clear_tomatometer,' +
+      // The sign-in gate: the "more" dots that reveal QR and code login are a bare <img>
+      // carrying a jQuery handler - no href, no onclick, no cursor:pointer - so every other
+      // pass here misses it and the Google link is the only thing on the page you can reach.
+      // The img, not the <p>: the handler is bound to the image, and the <p> spans the row.
+      '.login_more img',
     // Long lists that live inside one panel each, swept only while that panel is open: the
     // language pickers run to a couple of hundred entries, and a style lookup per entry is
     // more than the oldest sets this runs on can afford on every keypress.
