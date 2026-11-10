@@ -1,0 +1,1484 @@
+/*!
+ * MovieBox Pro TV - TizenBrew site mod for MovieBoxPro (movieboxpro.app)
+ *
+ * Remote-friendly browsing plus TV-style playback that drives the site's own
+ * player, so its subtitles, subtitle sync and quality menus keep working.
+ *
+ * Plain ES5 on purpose: runs on 2017+ Samsung TVs (Chromium 47+) with no
+ * build step, so jsDelivr can serve this file straight from the GitHub repo.
+ *
+ * Browsing:  D-pad move | OK select | Back go back / close a popup
+ *            Red menu | Green search | Yellow history | Blue or Info help
+ *            CH+/CH- page up/down | Play open the player on a watch page
+ * Watching:  OK or Play/Pause play-pause | Left/Right skip 10s (keep pressing = bigger jumps)
+ *            Up/Down the player's own controls (subtitles, sync, quality...)
+ *            FF/RW skip 30s | Red subtitles | Green quality/settings
+ *            Yellow, Next or CH+ next episode | Prev or CH- previous episode
+ *            Back: close menu > hide controls > leave full screen
+ */
+(function () {
+  'use strict';
+
+  var W = window, D = document;
+
+  // ------------------------------------------------------------------ settings
+  var CFG = {
+    seekStep: 10,           // seconds per Left/Right press while watching
+    seekStepBig: 30,        // FF / RW keys
+    autoWatch: true,        // fill the TV by itself when a film or episode starts
+    fullscreen: 'pseudo',   // 'pseudo' fills the screen with the player (reliable on TVs); 'native' tries the Fullscreen API first
+    controlsTimeout: 7000,  // ms without a key before the player's controls are dismissed
+    osdTimeout: 2500,
+    homeURL: 'https://www.movieboxpro.app/',
+    historyURL: '/index/index/history',
+    siteRe: /(^|\.)movieboxpro\./i,
+    quick: [
+      { label: 'Home', url: '/' },
+      { label: 'Search', action: 'search' },
+      { label: 'History', url: '/index/index/history' },
+      { label: 'Favorites', url: '/index/index/fav_list' },
+      { label: 'My lists', url: '/index/playlist/my_list?type=mine' },
+      { label: 'Sign in with a code', url: '/index/index/tv_login' }
+    ],
+    debug: false
+  };
+
+  // ------------------------------------------------------------------ keys
+  var K = {
+    LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40, OK: 13, BACK: 10009,
+    PLAYPAUSE: 10252, PLAY: 415, PAUSE: 19, STOP: 413, FF: 417, RW: 412,
+    NEXT: 10233, PREV: 10232, CHUP: 427, CHDOWN: 428,
+    RED: 403, GREEN: 404, YELLOW: 405, BLUE: 406, INFO: 457, CAPTION: 10221
+  };
+  var KNOWN = {};
+  (function () { for (var k in K) if (K.hasOwnProperty(k)) KNOWN[K[k]] = true; })();
+  var TV_KEYS = ['MediaPlayPause', 'MediaPlay', 'MediaPause', 'MediaStop', 'MediaFastForward', 'MediaRewind',
+    'MediaTrackNext', 'MediaTrackPrevious', 'ChannelUp', 'ChannelDown', 'ColorF0Red', 'ColorF1Green',
+    'ColorF2Yellow', 'ColorF3Blue', 'Info', 'Caption'];
+
+  // ------------------------------------------------------------------ patterns
+  var RE_CC = /caption|subtitle|(^|[\s_-])cc([\s_-]|$)|\u5b57\u5e55/i;
+  var RE_SETTINGS = /quality|setting|resolution|(^|\s)hd(\s|$)|gear|\u6e05\u6670|\u753b\u8d28|\u8bbe\u7f6e/i;
+  var RE_NEXT = /next\s*-?(ep|episode)|\u4e0b\u4e00\u96c6|(^|[\s_-])next([\s_-]|$)/i;
+  var RE_PREV = /prev(ious)?\s*-?(ep|episode)|\u4e0a\u4e00\u96c6|(^|[\s_-])prev(ious)?([\s_-]|$)/i;
+  var RE_CLOSE = /(^|[\s_-])(close|cancel|dismiss|done|back)([\s_-]|$)|\u00d7|\u2715|\u2716|\u5173\u95ed|\u8fd4\u56de|\u53d6\u6d88/i;
+  var RE_PLAYBTN = /(^|\s)(play|pause)(\s|$)|\u64ad\u653e|\u6682\u505c/i;
+  var RE_WATCH = /(^|\s)(play|watch|resume|continue)(\s|$)|\u64ad\u653e/i;
+  var RE_START = /(^|\s)(play|start)(\s|$)|\u64ad\u653e/i;
+  var RE_SEARCH = /search|keyword|query|\u641c\u7d22/i;
+  var RE_SEEKBAR = /progress|seek|timeline|slider|scrub|rail|time-?bar/i;
+  var RE_SELECTED = /(^|[\s_-])(active|selected|current|checked|on)([\s_-]|$)/i;
+  var PLAYER_RE = /(^|[\s_-])(jwplayer|jw-wrapper|video-js|vjs|plyr|dplayer|art-video-player|artplayer|xgplayer|shaka|clappr|mejs|player|videoplayer|video-player)/i;
+
+  var SEMANTIC = 'a[href],area[href],button,input,select,textarea,summary,iframe,[tabindex],[role="button"],' +
+    '[role="link"],[role="menuitem"],[role="menuitemradio"],[role="menuitemcheckbox"],[role="option"],[role="tab"],' +
+    '[role="checkbox"],[role="radio"],[role="switch"],[role="slider"],[role="treeitem"],[onclick],[contenteditable="true"]';
+  var CLICKY = 'a[href],button,[role="button"],[role="link"],[role="menuitem"],[role="menuitemradio"],' +
+    '[role="menuitemcheckbox"],[role="option"],[role="tab"],[onclick]';
+  var POINTER_TAGS = 'div,span,li,i,img,svg,p,em,b,strong,label,h1,h2,h3,h4,h5,h6,figure,dd,dt,td,th,section,article,ul,picture';
+  var DIALOG_SEL = '[role="dialog"],[role="alertdialog"],[aria-modal="true"],.modal.in,.modal.show,.layui-layer,' +
+    '.el-dialog__wrapper,.ant-modal-wrap,.swal2-container,.mfp-wrap,.fancybox-container';
+
+  // ------------------------------------------------------------------ state
+  var IS_TOP = (function () { try { return W.top === W; } catch (e) { return false; } })();
+  var mode = 'page';            // page | watch | controls | frame | idle
+  var focusEl = null;
+  var traps = [];               // open popups/menus that hold the focus: { opener, box }
+  var video = null, box = null; // main <video> and its player container
+  var ui = {};
+  var panel = null;             // open help / menu / picker
+  var handledKeys = {};
+  var lastKey = 0, lastMove = 0;
+  var dirty = true, cache = null, scanSeq = 0, scanId = 0;
+  var frameEl = null;           // top window: iframe that currently gets the keys
+  var frameActive = false;      // inside an iframe: the parent page handed us the keys
+  var pseudo = { el: null, chain: [], hidden: [], inner: [], sy: 0 };
+  var ctl = { timer: null, tick: 0 };
+  var sk = { target: null, timer: null, count: 0, dir: 0, at: 0, quiet: false };
+  var osdTimer = null, osdTick = null, toastTimer = null;
+  var HAS_POINTER = typeof W.PointerEvent === 'function';
+  var leaving = false;
+
+  // ------------------------------------------------------------------ utils
+  function now() { return new Date().getTime(); }
+  function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+  function log() {
+    if (CFG.debug && W.console) W.console.log.apply(W.console, ['[mbtv]'].concat([].slice.call(arguments)));
+  }
+  function rect(el) {
+    var r = el.getBoundingClientRect();
+    return { l: r.left, t: r.top, r: r.right, b: r.bottom, w: r.width, h: r.height };
+  }
+  function area(r) { return r.w * r.h; }
+  function attached(el) { return !!el && el.nodeType === 1 && D.documentElement.contains(el); }
+  function css(el) { return W.getComputedStyle(el) || {}; }
+  function inUI(el) { return !!(ui.root && ui.root.contains(el)); }
+  function cls(el) { var c = el.getAttribute && el.getAttribute('class'); return c ? String(c) : ''; }
+  function shortText(el) {
+    var t = (el.textContent || '').replace(/\s+/g, ' ');
+    return t.length <= 48 ? t.replace(/^\s+|\s+$/g, '') : '';
+  }
+  function labelText(el) {
+    if (!el.getAttribute) return '';
+    return ((el.getAttribute('aria-label') || '') + ' ' + (el.getAttribute('title') || '') + ' ' +
+      (el.getAttribute('data-title') || '') + ' ' + (el.getAttribute('alt') || '') + ' ' +
+      (el.getAttribute('data-tooltip') || '') + ' ' + (el.getAttribute('value') && el.tagName === 'INPUT' ? el.getAttribute('value') : '') + ' ' +
+      shortText(el)).toLowerCase();
+  }
+  function labelAttr(el) { return (cls(el) + ' ' + (el.id || '')).toLowerCase(); }
+  function center(el) { var r = rect(el); return { x: r.l + r.w / 2, y: r.t + r.h / 2 }; }
+  function fmt(s) {
+    s = Math.max(0, Math.floor(s || 0));
+    var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+    return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (x < 10 ? '0' : '') + x;
+  }
+  function onSite() { return CFG.siteRe.test(location.hostname); }
+  function siteURL(path) {
+    var base = onSite() ? location.protocol + '//' + location.host : CFG.homeURL.replace(/\/+$/, '');
+    return base + path;
+  }
+  function markDirty() { dirty = true; }
+  function typing() {
+    var a = D.activeElement;
+    if (!a || a === D.body) return false;
+    if (a.isContentEditable || a.tagName === 'TEXTAREA') return true;
+    if (a.tagName !== 'INPUT') return false;
+    return /^(text|search|email|password|number|tel|url)$/.test((a.type || 'text').toLowerCase());
+  }
+
+  // ------------------------------------------------------------------ visibility
+  function hiddenByOpacity(el) {
+    var n = el, path = [], res = false, i;
+    while (n && n.nodeType === 1) {
+      if (n.__mbtvOpS === scanId) { res = n.__mbtvOp; break; }
+      path.push(n);
+      var s = css(n);
+      if (s.display === 'none' || parseFloat(s.opacity) < 0.05) { res = true; break; }
+      n = n.parentElement;
+    }
+    for (i = 0; i < path.length; i++) { path[i].__mbtvOpS = scanId; path[i].__mbtvOp = res; }
+    return res;
+  }
+  function shown(el, r) {
+    r = r || rect(el);
+    if (r.w < 2 || r.h < 2) return false;
+    var v = css(el).visibility;
+    if (v === 'hidden' || v === 'collapse') return false;
+    return !hiddenByOpacity(el);
+  }
+  function shownQuick(el) { return attached(el) && shown(el); }
+  // Off-screen items inside an overflow:hidden box (sliding carousels) can't be reached by scrolling: skip them.
+  function clipped(el, r) {
+    var n = el.parentElement;
+    while (n && n !== D.body && n !== D.documentElement) {
+      var s = css(n);
+      if (s.position === 'fixed') return false;
+      var ox = s.overflowX, oy = s.overflowY;
+      if (ox !== 'visible' || oy !== 'visible') {
+        var sx = ox === 'auto' || ox === 'scroll', sy = oy === 'auto' || oy === 'scroll';
+        var p = rect(n);
+        if (p.w < 2 || p.h < 2) return true;
+        if (!sx && Math.min(r.r, p.r) - Math.max(r.l, p.l) < Math.min(r.w, p.w) * 0.6) return true;
+        if (!sy && Math.min(r.b, p.b) - Math.max(r.t, p.t) < Math.min(r.h, p.h) * 0.6) return true;
+        if (sx || sy) return false;
+      }
+      n = n.parentElement;
+    }
+    return false;
+  }
+
+  // ------------------------------------------------------------------ candidates
+  function okSemantic(el) {
+    if (inUI(el)) return false;
+    var tag = el.tagName;
+    if (tag === 'VIDEO') return false;
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') return false;
+    if (tag === 'INPUT' && (el.type || '').toLowerCase() === 'hidden') return false;
+    if (tag === 'IFRAME' && !IS_TOP) return false;
+    var ti = el.getAttribute('tabindex');
+    if (ti !== null && parseInt(ti, 10) < 0 && !/^(A|BUTTON|INPUT|SELECT|TEXTAREA|SUMMARY|IFRAME)$/.test(tag) &&
+      !el.getAttribute('role') && !el.hasAttribute('onclick')) return false;
+    return true;
+  }
+  function rescan(scope) {
+    var list = [], i, el, stamp = ++scanSeq, vh = W.innerHeight;
+    var nodes = scope.querySelectorAll(SEMANTIC);
+    for (i = 0; i < nodes.length; i++) {
+      el = nodes[i];
+      if (okSemantic(el)) { el.__mbtvCand = stamp; list.push(el); }
+    }
+    // div/span "buttons" that only reveal themselves through cursor: pointer
+    var pts = scope.querySelectorAll(POINTER_TAGS);
+    for (i = 0; i < pts.length; i++) {
+      el = pts[i];
+      if (el.__mbtvCand === stamp || inUI(el)) continue;
+      var r = el.getBoundingClientRect();
+      if (r.width < 10 || r.height < 10 || r.bottom < -vh * 2.5 || r.top > vh * 3.5) continue;
+      if (css(el).cursor !== 'pointer') continue;
+      var p = el.parentElement;
+      if (p && p !== scope && css(p).cursor === 'pointer') continue;
+      if (p && p.closest && p.closest(CLICKY)) continue;
+      el.__mbtvCand = stamp; list.push(el);
+    }
+    cache = { scope: scope, list: list, sy: W.pageYOffset, t: now(), mode: mode };
+    dirty = false;
+  }
+  function candidates(scope) {
+    scope = scope || D.body;
+    if (dirty || !cache || cache.scope !== scope || cache.mode !== mode ||
+      Math.abs(W.pageYOffset - cache.sy) > W.innerHeight * 0.6 || now() - cache.t > 5000) rescan(scope);
+    scanId++;
+    var out = [], vh = W.innerHeight, vw = W.innerWidth, i;
+    var tile = (mode === 'page' && scope === D.body) ? playerTile() : null;
+    var boxArea = (mode === 'controls' && box) ? area(rect(box)) : 0;
+    for (i = 0; i < cache.list.length; i++) {
+      var el = cache.list[i];
+      if (!attached(el)) continue;
+      if (tile && tile.contains(el)) continue;
+      var r = rect(el);
+      if (r.w < 4 || r.h < 4) continue;
+      if (r.b < -vh * 2 || r.t > vh * 3 || r.r < -vw || r.l > vw * 2.5) continue;
+      if (el.tagName === 'IFRAME' && (r.w < 200 || r.h < 120)) continue;
+      if (boxArea && (el === box || area(r) > boxArea * 0.5)) continue;
+      if (!shown(el, r) || clipped(el, r)) continue;
+      out.push({ el: el, r: r });
+    }
+    if (tile) {
+      var tr = rect(tile);
+      if (tr.w > 50 && shown(tile, tr)) out.push({ el: tile, r: tr });
+    }
+    return out;
+  }
+  function elems(list) { var a = []; for (var i = 0; i < list.length; i++) a.push(list[i].el); return a; }
+
+  // ------------------------------------------------------------------ spatial navigation
+  function findNext(cur, dir, cands) {
+    var c = rect(cur), ccx = c.l + c.w / 2, ccy = c.t + c.h / 2, horiz = dir === 'left' || dir === 'right';
+    var best = [null, null], bestScore = [Infinity, Infinity];
+    for (var i = 0; i < cands.length; i++) {
+      var el = cands[i].el, r = cands[i].r;
+      if (el === cur || el.contains(cur) || cur.contains(el)) continue;
+      var cx = r.l + r.w / 2, cy = r.t + r.h / 2, primary, overlap;
+      if (dir === 'right') {
+        if (r.l < c.r - 4 && !(cx > c.r && r.l > c.l + 4)) continue;
+        primary = Math.max(0, r.l - c.r);
+        overlap = Math.min(c.b, r.b) - Math.max(c.t, r.t);
+      } else if (dir === 'left') {
+        if (r.r > c.l + 4 && !(cx < c.l && r.r < c.r - 4)) continue;
+        primary = Math.max(0, c.l - r.r);
+        overlap = Math.min(c.b, r.b) - Math.max(c.t, r.t);
+      } else if (dir === 'down') {
+        if (r.t < c.b - 4 && !(cy > c.b && r.t > c.t + 4)) continue;
+        primary = Math.max(0, r.t - c.b);
+        overlap = Math.min(c.r, r.r) - Math.max(c.l, r.l);
+      } else {
+        if (r.b > c.t + 4 && !(cy < c.t && r.b < c.b - 4)) continue;
+        primary = Math.max(0, c.t - r.b);
+        overlap = Math.min(c.r, r.r) - Math.max(c.l, r.l);
+      }
+      var ortho = overlap > 0 ? 0 : -overlap;
+      var dPri = horiz ? Math.abs(cx - ccx) : Math.abs(cy - ccy);
+      var dOrt = horiz ? Math.abs(cy - ccy) : Math.abs(cx - ccx);
+      // left/right: same row only (or nearly level). up/down: same column or roughly below/above first,
+      // then anything below/above so you can always get out of a header or a short row.
+      var tier;
+      if (horiz) {
+        if (!(overlap > 0 || ortho <= Math.max(20, c.h * 0.5))) continue;
+        tier = 0;
+      } else tier = (overlap > 0 || dPri >= dOrt * 0.3) ? 0 : 1;
+      var score = primary + ortho * 4 + dOrt * 0.15 - (overlap > 0 ? Math.min(overlap, 40) * 0.5 : 0);
+      if (score < bestScore[tier]) { bestScore[tier] = score; best[tier] = el; }
+    }
+    return best[0] || best[1];
+  }
+  function headerOffset() {
+    var h = 0, els = D.querySelectorAll('header,nav,[class*="header"],[class*="nav"],[id*="header"],[class*="top"]');
+    for (var i = 0; i < els.length && i < 80; i++) {
+      var s = css(els[i]);
+      if (s.position !== 'fixed' && s.position !== 'sticky') continue;
+      var r = rect(els[i]);
+      if (r.t <= 2 && r.b > 0 && r.b < W.innerHeight * 0.35 && r.w > W.innerWidth * 0.5) h = Math.max(h, r.b);
+    }
+    return h;
+  }
+  // Bring an element into view: inner scrollers first (rows, lists), then the page, keeping focus near the middle.
+  function reveal(el) {
+    var r = rect(el), n = el.parentElement;
+    while (n && n !== D.body && n !== D.documentElement) {
+      var s = css(n);
+      var sx = (s.overflowX === 'auto' || s.overflowX === 'scroll') && n.scrollWidth > n.clientWidth + 1;
+      var sy = (s.overflowY === 'auto' || s.overflowY === 'scroll') && n.scrollHeight > n.clientHeight + 1;
+      if (sx || sy) {
+        var p = rect(n), pad = 40;
+        if (sx) {
+          if (r.l < p.l + pad) n.scrollLeft -= (p.l + pad - r.l);
+          else if (r.r > p.r - pad) n.scrollLeft += (r.r - (p.r - pad));
+        }
+        if (sy) {
+          if (r.t < p.t + pad) n.scrollTop -= (p.t + pad - r.t);
+          else if (r.b > p.b - pad) n.scrollTop += (r.b - (p.b - pad));
+        }
+        r = rect(el);
+      }
+      if (s.position === 'fixed') return;
+      n = n.parentElement;
+    }
+    if (mode !== 'page') return;
+    var top = headerOffset() + 24, bottom = W.innerHeight - 32;
+    if (r.t < top || r.b > bottom) {
+      var mid = top + (W.innerHeight - top) / 2;
+      var delta = r.h > bottom - top ? r.t - top : (r.t + r.h / 2) - mid;
+      W.scrollBy(0, Math.round(delta));
+    }
+    if (r.l < 0 || r.r > W.innerWidth) W.scrollBy(r.l < 0 ? Math.round(r.l - 40) : Math.round(r.r - W.innerWidth + 40), 0);
+  }
+  function pickInitial(cands, scope) {
+    if (!cands || !cands.length) return null;
+    var vh = W.innerHeight, inPage = mode === 'page' && (!scope || scope === D.body);
+    var top = inPage ? headerOffset() : 0, best = null, bestS = Infinity, play = null, i;
+    if (inPage && box) for (i = 0; i < cands.length; i++) if (cands[i].el === box && cands[i].r.t < vh && cands[i].r.b > 0) return box;
+    for (i = 0; i < cands.length; i++) {
+      var c = cands[i], r = c.r;
+      if (r.b < 0 || r.t > vh) continue;
+      var s = (r.t < top ? 5000 : 0) + r.t * 2 + r.l;
+      if (s < bestS) { bestS = s; best = c.el; }
+      if (!play && inPage && r.w >= 70 && r.h >= 28 && RE_WATCH.test(labelText(c.el))) play = c.el;
+    }
+    if (!inPage) {
+      for (i = 0; i < cands.length; i++) {
+        var el = cands[i].el;
+        if (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true' || RE_SELECTED.test(cls(el))) return el;
+      }
+    }
+    return play || best || cands[0].el;
+  }
+  function pickControl(cands) {
+    if (!cands.length || !box) return cands.length ? cands[0].el : null;
+    var br = rect(box), best = null, bs = Infinity;
+    for (var i = 0; i < cands.length; i++) {
+      var el = cands[i].el, r = cands[i].r;
+      if (RE_PLAYBTN.test(labelText(el)) && r.t > br.t + br.h * 0.5) return el;
+      var s = Math.abs((r.t + r.h / 2) - (br.b - 40)) + Math.abs(r.l - br.l) * 0.3;
+      if (s < bs) { bs = s; best = el; }
+    }
+    return best;
+  }
+  function findLabeled(scope, re, loose) {
+    var list = loose ? looseList(scope) : candidates(scope), best = null, bs = 0, ba = Infinity;
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i].el, s = re.test(labelText(el)) ? 2 : (re.test(labelAttr(el)) ? 1 : 0);
+      if (!s) continue;
+      var a = area(list[i].r);
+      if (s > bs || (s === bs && a < ba)) { best = el; bs = s; ba = a; }
+    }
+    return best;
+  }
+  // Everything clickable with a size, visible or not (used while full screen hides the rest of the page).
+  function looseList(scope) {
+    var out = [], nodes = scope.querySelectorAll(CLICKY);
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (inUI(el)) continue;
+      var r = rect(el);
+      if (r.w > 4 && r.h > 4) out.push({ el: el, r: r });
+    }
+    return out;
+  }
+
+  // ------------------------------------------------------------------ synthetic input
+  function fire(el, type, x, y) {
+    var nb = /enter|leave/.test(type), ev;
+    var init = { bubbles: !nb, cancelable: !nb, view: W, clientX: x, clientY: y, screenX: x, screenY: y,
+      button: 0, buttons: /down/.test(type) ? 1 : 0 };
+    if (type.indexOf('pointer') === 0) {
+      if (!HAS_POINTER) return;
+      init.pointerId = 1; init.pointerType = 'mouse'; init.isPrimary = true; init.width = 1; init.height = 1;
+      try { ev = new W.PointerEvent(type, init); } catch (e) { return; }
+    } else {
+      try { ev = new W.MouseEvent(type, init); } catch (e2) {
+        ev = D.createEvent('MouseEvents');
+        ev.initMouseEvent(type, init.bubbles, init.cancelable, W, 0, x, y, x, y, false, false, false, false, 0, null);
+      }
+    }
+    try { el.dispatchEvent(ev); } catch (e3) {}
+  }
+  function hover(el) {
+    var c = center(el);
+    fire(el, 'pointerover', c.x, c.y); fire(el, 'pointerenter', c.x, c.y);
+    fire(el, 'mouseover', c.x, c.y); fire(el, 'mouseenter', c.x, c.y); fire(el, 'mousemove', c.x, c.y);
+  }
+  function unhover(el) {
+    var c = center(el);
+    fire(el, 'pointerout', c.x, c.y); fire(el, 'pointerleave', c.x, c.y);
+    fire(el, 'mouseout', c.x, c.y); fire(el, 'mouseleave', c.x, c.y);
+  }
+  function clickEl(el) {
+    if (!el || !attached(el)) return;
+    var r = rect(el), x = r.l + r.w / 2, y = r.t + r.h / 2, t = el;
+    try { var hit = D.elementFromPoint(x, y); if (hit && hit !== el && el.contains(hit)) t = hit; } catch (e) {}
+    fire(t, 'pointerover', x, y); fire(t, 'mouseover', x, y);
+    fire(t, 'pointerdown', x, y); fire(t, 'mousedown', x, y);
+    fire(t, 'pointerup', x, y); fire(t, 'mouseup', x, y);
+    if (t === el && typeof el.click === 'function' && /^(A|BUTTON|INPUT|SUMMARY|LABEL)$/.test(el.tagName)) el.click();
+    else fire(t, 'click', x, y);
+  }
+  function sendKey(target, keyCode, key) {
+    var types = ['keydown', 'keyup'];
+    for (var i = 0; i < types.length; i++) {
+      var ev;
+      try {
+        ev = new W.KeyboardEvent(types[i], { key: key, code: key, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true });
+      } catch (e) { ev = D.createEvent('Event'); ev.initEvent(types[i], true, true); }
+      try {
+        Object.defineProperty(ev, 'keyCode', { get: function () { return keyCode; } });
+        Object.defineProperty(ev, 'which', { get: function () { return keyCode; } });
+        if (!ev.key) Object.defineProperty(ev, 'key', { get: function () { return key; } });
+      } catch (e2) {}
+      ev.__mbtv = true;   // old engines without isTrusted: never treat our own Escape as a remote press
+      try { (target || D).dispatchEvent(ev); } catch (e3) {}
+    }
+  }
+
+  // ------------------------------------------------------------------ focus
+  function setFocus(el, opts) {
+    if (!el) return;
+    var prev = focusEl;
+    if (prev && prev !== el && attached(prev)) unhover(prev);
+    focusEl = el;
+    if (!opts || !opts.noScroll) reveal(el);
+    hover(el);
+    var tag = el.tagName, ti = el.getAttribute('tabindex');
+    if (!/^(INPUT|TEXTAREA|SELECT|IFRAME)$/.test(tag) && !el.isContentEditable &&
+      (/^(A|BUTTON)$/.test(tag) || (ti !== null && parseInt(ti, 10) >= 0))) {
+      try { el.focus({ preventScroll: true }); } catch (e) {}
+    }
+    drawRing();
+  }
+  function refocus() {
+    var scope = currentScope(), c = candidates(scope);
+    var el = (mode === 'controls' && !traps.length) ? pickControl(c) : pickInitial(c, scope);
+    if (el) setFocus(el); else { focusEl = null; drawRing(); }
+  }
+  function move(dir, e) {
+    if (e && e.repeat && now() - lastMove < 90) return;
+    lastMove = now();
+    var scope = currentScope(), cands = candidates(scope);
+    if (!cands.length) { if (mode === 'page' && (dir === 'up' || dir === 'down')) nudge(dir); return; }
+    var cur = focusEl && attached(focusEl) && scope.contains(focusEl) && shown(focusEl) ? focusEl : null;
+    if (!cur) { setFocus((mode === 'controls' && !traps.length) ? pickControl(cands) : pickInitial(cands, scope)); return; }
+    var next = findNext(cur, dir, cands);
+    if (next) setFocus(next);
+    else if (mode === 'page' && scope === D.body && (dir === 'up' || dir === 'down')) nudge(dir);
+  }
+  function nudge(dir) {
+    W.scrollBy(0, (dir === 'down' ? 1 : -1) * Math.round(W.innerHeight * 0.4));
+    markDirty(); drawRing();
+  }
+  function pageJump(dir) {
+    W.scrollBy(0, dir * Math.round(W.innerHeight * 0.8));
+    markDirty();
+    var cands = candidates(currentScope()), top = headerOffset(), best = null, bs = Infinity;
+    var x = focusEl && attached(focusEl) ? center(focusEl).x : W.innerWidth / 2;
+    for (var i = 0; i < cands.length; i++) {
+      var r = cands[i].r;
+      if (r.t < top || r.b > W.innerHeight) continue;
+      var s = r.t * 2 + Math.abs(r.l + r.w / 2 - x);
+      if (s < bs) { bs = s; best = cands[i].el; }
+    }
+    if (best) setFocus(best, { noScroll: true }); else drawRing();
+  }
+
+  // ------------------------------------------------------------------ popups that hold the focus
+  function commonAncestor(nodes) {
+    var a = nodes[0];
+    for (var i = 1; i < nodes.length && a; i++) { while (a && !a.contains(nodes[i])) a = a.parentElement; }
+    return a;
+  }
+  function overlayish(el) {
+    var n = el, depth = 0;
+    while (n && n !== D.body && depth < 10) {
+      var s = css(n), role = (n.getAttribute && n.getAttribute('role')) || '';
+      if (s.position === 'fixed') return true;
+      if (s.position === 'absolute' && (s.zIndex !== 'auto' || /menu|pop|drop|modal|dialog|layer|overlay|panel|list|select|option/i.test(cls(n)))) return true;
+      if (/dialog|menu|listbox/.test(role) || (n.getAttribute && n.getAttribute('aria-modal') === 'true')) return true;
+      n = n.parentElement; depth++;
+    }
+    return false;
+  }
+  function baseScope() { return (mode === 'controls' && box && attached(box)) ? box : D.body; }
+  function pruneTraps() {
+    while (traps.length) {
+      var t = traps[traps.length - 1];
+      if (attached(t.box) && shown(t.box) && candidates(t.box).length) break;
+      traps.pop();
+    }
+  }
+  function currentScope() { pruneTraps(); return traps.length ? traps[traps.length - 1].box : baseScope(); }
+  function pushTrap(opener, container) {
+    for (var i = 0; i < traps.length; i++) if (traps[i].box === container) { traps.splice(i + 1); return; }
+    traps.push({ opener: opener, box: container });
+  }
+  function preferred(nodes) {
+    var best = null, bs = Infinity;
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      if (el.getAttribute('aria-checked') === 'true' || el.getAttribute('aria-selected') === 'true' || RE_SELECTED.test(cls(el))) return el;
+      var r = rect(el), s = r.t * 2 + r.l;
+      if (s < bs) { bs = s; best = el; }
+    }
+    return best;
+  }
+  function watchForPopup(opener, before) {
+    var tries = 0;
+    var check = function () {
+      tries++;
+      markDirty();
+      var after = candidates(baseScope()), fresh = [];
+      for (var i = 0; i < after.length; i++) if (before.indexOf(after[i].el) < 0) fresh.push(after[i].el);
+      if (fresh.length) {
+        var container = commonAncestor(fresh);
+        var isMenu = mode === 'controls' ?
+          (fresh.length >= 2 && box && (overlayish(container) || area(rect(container)) < area(rect(box)) * 0.5)) :
+          overlayish(container);
+        if (container && container !== D.body && isMenu) {
+          pushTrap(opener, container);
+          setFocus(preferred(fresh), { noScroll: mode !== 'page' });
+          return;
+        }
+      }
+      if (focusEl && (!attached(focusEl) || !shown(focusEl))) {
+        var snap = traps.slice(), target = null, k;
+        pruneTraps();
+        for (k = snap.length - 1; k >= traps.length && !target; k--) {
+          var o = snap[k].opener;
+          if (o && attached(o) && shown(o)) target = o;
+        }
+        if (!target && opener && attached(opener) && shown(opener)) target = opener;
+        if (target) setFocus(target, { noScroll: mode !== 'page' }); else refocus();
+        return;
+      }
+      if (tries < 3) setTimeout(check, 220);
+    };
+    setTimeout(check, 160);
+  }
+  function openDialog() {
+    var list = D.querySelectorAll(DIALOG_SEL), best = null, bestZ = -1;
+    for (var i = 0; i < list.length; i++) {
+      var el = list[i];
+      if (inUI(el)) continue;
+      var r = rect(el);
+      if (r.w < 120 || r.h < 80 || !shown(el, r)) continue;
+      var z = parseInt(css(el).zIndex, 10) || 0;
+      if (z >= bestZ) { bestZ = z; best = el; }
+    }
+    return best;
+  }
+  function adoptDialog() {
+    if (traps.length || mode !== 'page') return false;
+    var dlg = openDialog();
+    if (!dlg) return false;
+    var c = candidates(dlg);
+    if (!c.length) return false;
+    traps.push({ opener: focusEl, box: dlg });
+    if (!focusEl || !dlg.contains(focusEl)) { setFocus(pickInitial(c, dlg), { noScroll: true }); return true; }
+    return false;
+  }
+  function closeTop() {
+    var t = traps[traps.length - 1];
+    if (!t) return;
+    sendKey(focusEl && t.box.contains(focusEl) ? focusEl : t.box, 27, 'Escape');
+    setTimeout(function () {
+      markDirty();
+      if (attached(t.box) && shown(t.box) && candidates(t.box).length) {
+        var closer = findLabeled(t.box, RE_CLOSE);
+        if (closer) clickEl(closer);
+        else if (t.opener && attached(t.opener) && !t.box.contains(t.opener) && shown(t.opener)) clickEl(t.opener);
+      }
+      setTimeout(function () {
+        markDirty();
+        var i = traps.indexOf(t);
+        if (i >= 0) traps.splice(i);
+        pruneTraps();
+        if (t.opener && attached(t.opener) && shown(t.opener)) setFocus(t.opener, { noScroll: mode !== 'page' });
+        else refocus();
+      }, 160);
+    }, 120);
+  }
+
+  // ------------------------------------------------------------------ activation
+  function activate(el) {
+    if (!el || !attached(el)) return;
+    var tag = el.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || el.isContentEditable) {
+      if (/^(checkbox|radio|submit|button|reset|image|file|range|color)$/i.test(el.type || '')) { clickEl(el); return; }
+      try { el.focus(); } catch (e) {}   // the TV keyboard opens
+      return;
+    }
+    if (tag === 'SELECT') { openSelect(el); return; }
+    if (tag === 'IFRAME') { enterFrame(el); return; }
+    if (mode === 'page' && box && el === box) { enterWatch(true); return; }
+    if (tag === 'A') {
+      var tg = el.getAttribute('target');
+      if (tg && tg !== '_self') el.setAttribute('target', '_self');
+      savePos();
+    }
+    markDirty();
+    var before = elems(candidates(baseScope()));
+    clickEl(el);
+    watchForPopup(el, before);
+  }
+  function openSelect(sel) {
+    var items = [], opts = sel.options;
+    for (var i = 0; i < opts.length; i++) (function (idx) {
+      if (opts[idx].disabled) return;
+      items.push({ label: opts[idx].text, selected: opts[idx].selected, run: function () {
+        sel.selectedIndex = idx;
+        var evs = ['input', 'change'];
+        for (var j = 0; j < evs.length; j++) {
+          var ev; try { ev = new Event(evs[j], { bubbles: true }); } catch (e) { ev = D.createEvent('HTMLEvents'); ev.initEvent(evs[j], true, false); }
+          sel.dispatchEvent(ev);
+        }
+        markDirty(); setFocus(sel, { noScroll: true });
+      } });
+    })(i);
+    var title = sel.getAttribute('aria-label') || sel.getAttribute('title') || '';
+    if (!title && sel.id) { var lb = D.querySelector('label[for="' + sel.id + '"]'); if (lb) title = shortText(lb); }
+    openPanel(title || 'Choose', items, 'picker');
+  }
+
+  // ------------------------------------------------------------------ player
+  function mainVideo() {
+    var vids = D.getElementsByTagName('video'), best = null, bestA = 0;
+    for (var i = 0; i < vids.length; i++) {
+      var v = vids[i], r = rect(v), a = area(r);
+      if (r.w < 240 || r.h < 130) continue;
+      if (v.muted && (v.loop || v.autoplay) && v.paused === false && mode === 'page') continue; // background trailers
+      if (!v.paused) a *= 4;
+      if (a > bestA) { bestA = a; best = v; }
+    }
+    return best;
+  }
+  function playerBoxOf(v) {
+    var vr = rect(v), same = v, named = null, n = v.parentElement, depth = 0;
+    while (n && n !== D.body && n !== D.documentElement && depth < 10) {
+      var r = rect(n);
+      if (r.w > vr.w * 1.6 + 4 || r.h > vr.h * 1.9 + 4) break;
+      if (r.w <= vr.w * 1.15 + 4 && r.h <= vr.h * 1.4 + 4) same = n;
+      if (PLAYER_RE.test(cls(n) + ' ' + (n.id || ''))) named = n;
+      n = n.parentElement; depth++;
+    }
+    return (named && named.contains(same)) ? named : same;
+  }
+  function playerTile() {
+    var v = mainVideo();
+    if (!v) return null;
+    if (v !== video || !box || !attached(box) || !box.contains(v)) { video = v; box = playerBoxOf(v); }
+    return box;
+  }
+  function ensurePlayer() {
+    var v = (video && attached(video) && box && attached(box) && box.contains(video)) ? video : mainVideo();
+    if (!v) return false;
+    if (v !== video || !box || !attached(box) || !box.contains(v)) {
+      video = v; box = playerBoxOf(v);
+      if (pseudo.el && pseudo.el.tagName !== 'IFRAME' && pseudo.el !== box) pseudoFS(box, true);
+    }
+    return true;
+  }
+  function html5(v) {
+    return {
+      play: function () { try { var p = v.play(); if (p && p['catch']) p['catch'](function () {}); } catch (e) {} },
+      pause: function () { try { v.pause(); } catch (e) {} },
+      toggle: function () { if (v.paused || v.ended) this.play(); else this.pause(); },
+      time: function () { return v.currentTime || 0; },
+      duration: function () {
+        var d = v.duration;
+        if (!isFinite(d) || d <= 0) { try { if (v.seekable && v.seekable.length) d = v.seekable.end(v.seekable.length - 1); } catch (e) {} }
+        return (isFinite(d) && d > 0) ? d : 0;
+      },
+      seek: function (t) { try { v.currentTime = t; } catch (e) {} }
+    };
+  }
+  function api() { return ensurePlayer() ? html5(video) : null; }
+  function startPlayback() {
+    var v = video;
+    if (!v) return;
+    if (v.currentSrc || v.src || v.querySelector('source')) html5(v).play();
+    setTimeout(function () {
+      if (video && video.paused && box) {
+        var big = findLabeled(box, RE_START);
+        if (big) clickEl(big);
+      }
+    }, 600);
+  }
+  function seekBy(dir, step, quiet) {
+    var a = api();
+    if (!a) return;
+    var t = now();
+    if (dir === sk.dir && t - sk.at < 1100) sk.count++; else sk.count = 0;
+    sk.dir = dir; sk.at = t;
+    if (!step) step = sk.count >= 8 ? 60 : (sk.count >= 3 ? 30 : CFG.seekStep);
+    var from = sk.target !== null ? sk.target : a.time(), d = a.duration();
+    var to = from + dir * step;
+    to = d ? clamp(to, 0, Math.max(0, d - 2)) : Math.max(0, to);
+    sk.target = to; sk.quiet = !!quiet;
+    if (!quiet) osd(true);
+    clearTimeout(sk.timer);
+    sk.timer = setTimeout(applySeek, quiet ? 250 : 450);
+  }
+  function applySeek() {
+    if (sk.target === null) return;
+    var a = api(), to = sk.target;
+    sk.target = null;
+    if (a) a.seek(to);
+    if (!sk.quiet && mode === 'watch') osd(true);
+  }
+  function fsElement() { return D.fullscreenElement || D.webkitFullscreenElement || D.webkitCurrentFullScreenElement || null; }
+  function requestNativeFS(el) {
+    try {
+      if (el.requestFullscreen) el.requestFullscreen();
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+      else if (el.webkitRequestFullScreen) el.webkitRequestFullScreen();
+    } catch (e) {}
+  }
+  function exitNativeFS() {
+    try {
+      if (D.exitFullscreen) D.exitFullscreen();
+      else if (D.webkitExitFullscreen) D.webkitExitFullscreen();
+      else if (D.webkitCancelFullScreen) D.webkitCancelFullScreen();
+    } catch (e) {}
+  }
+  function kickResize() {
+    setTimeout(function () {
+      var ev;
+      try { ev = new Event('resize'); } catch (e) { ev = D.createEvent('UIEvents'); ev.initUIEvent('resize', true, false, W, 0); }
+      W.dispatchEvent(ev);
+      markDirty(); drawRing();
+    }, 60);
+  }
+  // Fill the screen with one element and hide everything around it (no Fullscreen API needed).
+  function pseudoFS(el, on) {
+    var i;
+    if (pseudo.el && (!on || pseudo.el !== el)) {
+      var sy = pseudo.sy;
+      pseudo.el.classList.remove('mbtv-fs');
+      for (i = 0; i < pseudo.chain.length; i++) pseudo.chain[i].classList.remove('mbtv-fs-chain');
+      for (i = 0; i < pseudo.hidden.length; i++) pseudo.hidden[i].classList.remove('mbtv-fs-hide');
+      for (i = 0; i < pseudo.inner.length; i++) pseudo.inner[i].classList.remove('mbtv-fs-inner');
+      pseudo = { el: null, chain: [], hidden: [], inner: [], sy: 0 };
+      D.documentElement.classList.remove('mbtv-fs-on');
+      W.scrollTo(0, sy);
+      kickResize();
+    }
+    if (!on || !el || pseudo.el === el) return;
+    pseudo.el = el; pseudo.sy = W.pageYOffset;
+    el.classList.add('mbtv-fs');
+    if (video && el !== video && el.contains(video)) {
+      for (var m = video; m && m !== el; m = m.parentElement) { m.classList.add('mbtv-fs-inner'); pseudo.inner.push(m); }
+    }
+    var n = el;
+    while (n.parentElement) {
+      var p = n.parentElement;
+      if (p === D.documentElement) break;
+      p.classList.add('mbtv-fs-chain'); pseudo.chain.push(p);
+      for (var k = p.firstElementChild; k; k = k.nextElementSibling) {
+        if (k !== n && k !== ui.root && !k.classList.contains('mbtv-fs-hide')) { k.classList.add('mbtv-fs-hide'); pseudo.hidden.push(k); }
+      }
+      if (p === D.body) break;
+      n = p;
+    }
+    D.documentElement.classList.add('mbtv-fs-on');
+    kickResize();
+  }
+  function enterWatch(fromKey) {
+    if (!ensurePlayer()) return false;
+    stopControls();
+    mode = 'watch'; traps = [];
+    if (focusEl && attached(focusEl)) unhover(focusEl);
+    focusEl = null;
+    var f = fsElement();
+    if (!(f && f.contains(video))) {
+      if (CFG.fullscreen === 'native' && fromKey) {
+        requestNativeFS(box);
+        setTimeout(function () { if (mode !== 'page' && !fsElement()) pseudoFS(box, true); }, 400);
+      } else pseudoFS(box, true);
+    }
+    if (!IS_TOP) postParent({ mbtv: 'fs', on: true });
+    if (video.paused && fromKey) startPlayback();
+    video.__mbtvDismissed = null;
+    markDirty(); drawRing(); osd(true);
+    return true;
+  }
+  function exitWatch() {
+    stopControls();
+    hideOSD();
+    if (video) video.__mbtvDismissed = video.currentSrc || video.src || 'x';
+    pseudoFS(null, false);
+    if (fsElement()) exitNativeFS();
+    if (!IS_TOP) { postParent({ mbtv: 'fs', on: false }); exitFrame(); return; }
+    mode = 'page'; traps = [];
+    markDirty();
+    if (box && attached(box)) setFocus(box); else refocus();
+  }
+  function wake() {
+    if (!box || !attached(box)) return;
+    ctl.tick++;
+    var r = rect(box), x = r.l + r.w / 2 + (ctl.tick % 2 ? 1 : -1), y = r.t + r.h * 0.6, t = null;
+    try { t = D.elementFromPoint(x, y); } catch (e) {}
+    if (!t || !box.contains(t)) t = (video && box.contains(video)) ? video : box;
+    fire(t, 'pointermove', x, y); fire(t, 'mousemove', x, y);
+    if (t !== box) fire(box, 'mousemove', x, y);
+  }
+  function enterControls() {
+    if (!ensurePlayer()) return;
+    mode = 'controls'; traps = [];
+    hideOSD(); markDirty(); wake();
+    clearInterval(ctl.timer);
+    ctl.timer = setInterval(controlsTick, 1200);
+    setTimeout(function () {
+      if (mode !== 'controls') return;
+      markDirty();
+      var c = candidates(currentScope());
+      if (c.length) setFocus(pickControl(c), { noScroll: true });
+      else setTimeout(function () { if (mode === 'controls' && !focusEl) { markDirty(); refocus(); } }, 300);
+    }, 180);
+  }
+  function controlsTick() {
+    if (mode !== 'controls') { clearInterval(ctl.timer); return; }
+    pruneTraps();
+    if (!traps.length && now() - lastKey > CFG.controlsTimeout) { leaveControls(); return; }
+    wake();
+  }
+  function stopControls() { clearInterval(ctl.timer); ctl.timer = null; }
+  function leaveControls() {
+    stopControls();
+    if (focusEl && attached(focusEl)) unhover(focusEl);
+    traps = []; focusEl = null; mode = 'watch';
+    drawRing();
+    if (box && attached(box)) { var c = center(box); fire(box, 'mouseout', c.x, c.y); fire(box, 'mouseleave', c.x, c.y); }
+    try { if (D.activeElement && box && box.contains(D.activeElement)) D.activeElement.blur(); } catch (e) {}
+  }
+  function openPlayerMenu(re, name) {
+    if (!ensurePlayer()) return;
+    if (mode !== 'controls') enterControls();
+    wake();
+    var tries = 0;
+    var go = function () {
+      tries++;
+      markDirty(); wake();
+      var btn = findLabeled(box, re);
+      if (!btn) { if (tries < 3) setTimeout(go, 250); else toast('No ' + name + ' button in this player'); return; }
+      setFocus(btn, { noScroll: true });
+      activate(btn);
+    };
+    setTimeout(go, 260);
+  }
+  function episode(dir) {
+    var re = dir > 0 ? RE_NEXT : RE_PREV;
+    var el = (box && attached(box)) ? findLabeled(box, re) : null;
+    if (!el) el = findLabeled(D.body, re, true);
+    if (!el) { toast(dir > 0 ? 'No next-episode button found' : 'No previous-episode button found'); return; }
+    toast(dir > 0 ? 'Next episode' : 'Previous episode');
+    if (el.tagName === 'A') { var tg = el.getAttribute('target'); if (tg && tg !== '_self') el.setAttribute('target', '_self'); }
+    clickEl(el);
+  }
+  function isSeekBar(el) {
+    if (!box) return false;
+    var wide = rect(el).w > rect(box).w * 0.3;
+    return wide && (el.getAttribute('role') === 'slider' || RE_SEEKBAR.test(labelAttr(el)));
+  }
+  function onPlaying(e) {
+    var v = e.target;
+    if (!v || v.tagName !== 'VIDEO' || !CFG.autoWatch || mode !== 'page' || panel) return;
+    if (!IS_TOP && !frameActive) return;
+    if (v.__mbtvDismissed && v.__mbtvDismissed === (v.currentSrc || v.src || 'x')) return;
+    if (v.muted || rect(v).w < W.innerWidth * 0.35) return;
+    var d = v.duration;
+    if (isFinite(d) && d > 0 && d < 240) return; // trailers and previews
+    video = v; box = playerBoxOf(v);
+    enterWatch(false);
+  }
+  function onFSChange() {
+    var f = fsElement(), host = (f && f.tagName !== 'VIDEO') ? f : D.body;
+    if (ui.root && ui.root.parentNode !== host) host.appendChild(ui.root);
+    if (f) {
+      var v = mainVideo();
+      if (v && f.contains(v) && mode === 'page') { video = v; box = playerBoxOf(v); mode = 'watch'; focusEl = null; drawRing(); osd(true); }
+    } else if ((mode === 'watch' || mode === 'controls') && !pseudo.el) {
+      stopControls(); hideOSD(); mode = 'page'; traps = []; markDirty();
+      if (box && attached(box)) setFocus(box);
+    }
+  }
+
+  // ------------------------------------------------------------------ iframes (in case the player lives in one)
+  function postTo(win, msg) { try { win.postMessage(msg, '*'); } catch (e) {} }
+  function postParent(msg) { if (!IS_TOP) postTo(W.parent, msg); }
+  function frameFor(win) {
+    var fs = D.getElementsByTagName('iframe');
+    for (var i = 0; i < fs.length; i++) { try { if (fs[i].contentWindow === win) return fs[i]; } catch (e) {} }
+    return null;
+  }
+  function takeFocusBack() {
+    try { if (D.activeElement && D.activeElement.tagName === 'IFRAME') D.activeElement.blur(); } catch (e) {}
+    try { W.focus(); } catch (e2) {}
+  }
+  function enterFrame(ifr) {
+    frameEl = ifr; mode = 'frame';
+    if (focusEl && attached(focusEl)) unhover(focusEl);
+    drawRing();
+    try { ifr.focus(); } catch (e) {}
+    try { ifr.contentWindow.focus(); } catch (e2) {}
+    postTo(ifr.contentWindow, { mbtv: 'enter' });
+  }
+  function exitFrame() {
+    frameActive = false; mode = 'idle'; traps = [];
+    if (focusEl && attached(focusEl)) unhover(focusEl);
+    focusEl = null; drawRing(); hideOSD(); closePanel();
+    postParent({ mbtv: 'exit' });
+  }
+  function onMessage(e) {
+    var d = e.data;
+    if (!d || typeof d !== 'object' || !d.mbtv) return;
+    if (IS_TOP) {
+      var ifr = frameFor(e.source);
+      if (!ifr) return;
+      if (d.mbtv === 'exit') {
+        if (pseudo.el === ifr) pseudoFS(null, false);
+        if (frameEl === ifr) { frameEl = null; mode = 'page'; markDirty(); takeFocusBack(); setFocus(ifr); }
+      } else if (d.mbtv === 'fs') {
+        if (d.on) pseudoFS(ifr, true); else if (pseudo.el === ifr) pseudoFS(null, false);
+      } else if (d.mbtv === 'reclaim') {
+        takeFocusBack();
+        if (mode === 'frame') { frameEl = null; mode = 'page'; }
+        dispatchCode(d.code, null);
+      }
+    } else {
+      if (e.source !== W.parent) return;
+      if (d.mbtv === 'enter') {
+        frameActive = true; mode = 'page';
+        if (!enterWatch(true)) refocus();
+      } else if (d.mbtv === 'key' && frameActive) {
+        dispatchCode(d.code, { repeat: !!d.repeat });
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ back, history, position memory
+  function posKey() { return 'mbtv:pos:' + location.href; }
+  function cssPath(el) {
+    var parts = [];
+    while (el && el.nodeType === 1 && el !== D.body && parts.length < 14) {
+      var i = 1, s = el.previousElementSibling;
+      while (s) { if (s.tagName === el.tagName) i++; s = s.previousElementSibling; }
+      parts.unshift(el.tagName.toLowerCase() + ':nth-of-type(' + i + ')');
+      el = el.parentElement;
+    }
+    return 'body > ' + parts.join(' > ');
+  }
+  function savePos() {
+    if (!IS_TOP || mode !== 'page') return;
+    try {
+      var st = { sx: W.pageXOffset, sy: W.pageYOffset, t: now() };
+      if (focusEl && attached(focusEl)) {
+        var a = focusEl.tagName === 'A' ? focusEl : (focusEl.closest ? focusEl.closest('a[href]') : null);
+        st.href = a ? a.href : null;
+        st.path = cssPath(focusEl);
+      }
+      W.sessionStorage.setItem(posKey(), JSON.stringify(st));
+    } catch (e) {}
+  }
+  function restorePos() {
+    var st = null;
+    try { st = JSON.parse(W.sessionStorage.getItem(posKey()) || 'null'); } catch (e) {}
+    if (!st || now() - st.t > 6 * 3600 * 1000) return false;
+    var tries = 0;
+    var attempt = function () {
+      tries++;
+      if (focusEl || mode !== 'page') return;
+      var el = null, i;
+      if (st.href) {
+        var as = D.querySelectorAll('a[href]');
+        for (i = 0; i < as.length; i++) if (as[i].href === st.href && shownQuick(as[i])) { el = as[i]; break; }
+      }
+      if (!el && st.path) { try { el = D.querySelector(st.path); } catch (e2) {} if (el && !shownQuick(el)) el = null; }
+      W.scrollTo(st.sx, st.sy);   // also nudges lazy-loading lists to fetch the rows we were in
+      if (el) { markDirty(); setFocus(el); return; }
+      if (tries < 15) setTimeout(attempt, 200);
+      else { markDirty(); refocus(); }
+    };
+    attempt();
+    return true;
+  }
+  function goBack() {
+    if (!IS_TOP) { exitFrame(); return; }
+    var href = location.href;
+    savePos();
+    history.back();
+    setTimeout(function () { if (!leaving && location.href === href && mode === 'page' && !panel) openQuick(true); }, 1200);
+  }
+  function exitApp() {
+    try { W.tizen.application.getCurrentApplication().exit(); return; } catch (e) {}
+    history.back();
+  }
+  function pageBack() {
+    if (typing()) { D.activeElement.blur(); drawRing(); return; }
+    pruneTraps();
+    if (traps.length) { closeTop(); return; }
+    var dlg = openDialog();
+    if (dlg && candidates(dlg).length) { traps.push({ opener: focusEl, box: dlg }); closeTop(); return; }
+    goBack();
+  }
+  function findSearchInput() {
+    var ins = D.querySelectorAll('input,textarea'), fallback = null;
+    for (var i = 0; i < ins.length; i++) {
+      var el = ins[i], ty = (el.type || '').toLowerCase();
+      if (ty && !/^(search|text)$/.test(ty)) continue;
+      var hint = ty + ' ' + (el.name || '') + ' ' + (el.id || '') + ' ' + (el.getAttribute('placeholder') || '') + ' ' + cls(el) + ' ' + (el.getAttribute('aria-label') || '');
+      if (ty === 'search' || RE_SEARCH.test(hint)) { if (shownQuick(el)) return el; if (!fallback) fallback = el; }
+    }
+    return fallback;
+  }
+  function focusSearch() {
+    if (mode !== 'page') return;
+    var inp = findSearchInput();
+    if (inp && shownQuick(inp)) { setFocus(inp); try { inp.focus(); } catch (e) {} return; }
+    var trig = findLabeled(D.body, RE_SEARCH);
+    if (trig) {
+      clickEl(trig);
+      setTimeout(function () {
+        markDirty();
+        var i2 = findSearchInput();
+        if (i2 && shownQuick(i2)) { setFocus(i2); try { i2.focus(); } catch (e) {} } else if (attached(trig)) setFocus(trig);
+      }, 400);
+      return;
+    }
+    toast('No search box on this page');
+  }
+  function goTo(path) { savePos(); location.href = siteURL(path); }
+
+  // ------------------------------------------------------------------ key handling per mode
+  function typingKey(code, e) {
+    var a = D.activeElement;
+    if (code === K.BACK) { a.blur(); drawRing(); return true; }
+    if (code === K.UP || code === K.DOWN) { a.blur(); move(code === K.UP ? 'up' : 'down', e); return true; }
+    if ((code === K.LEFT || code === K.RIGHT) && !a.value) { a.blur(); move(code === K.LEFT ? 'left' : 'right', e); return true; }
+    return false;   // OK submits, Left/Right move the caret
+  }
+  function pageKey(code, e) {
+    if (typing()) return typingKey(code, e);
+    if ((code >= 37 && code <= 40) || code === K.OK) { if (adoptDialog()) return true; }
+    switch (code) {
+      case K.LEFT: move('left', e); return true;
+      case K.RIGHT: move('right', e); return true;
+      case K.UP: move('up', e); return true;
+      case K.DOWN: move('down', e); return true;
+      case K.OK:
+        if (!focusEl || !attached(focusEl) || !shown(focusEl)) { refocus(); return true; }
+        activate(focusEl); return true;
+      case K.BACK: pageBack(); return true;
+      case K.PLAY: case K.PLAYPAUSE:
+        if (playerTile()) { enterWatch(true); return true; }
+        return false;
+      case K.RED: openQuick(false); return true;
+      case K.GREEN: focusSearch(); return true;
+      case K.YELLOW: if (onSite()) goTo(CFG.historyURL); return true;
+      case K.BLUE: case K.INFO: showHelp(); return true;
+      case K.CHUP: pageJump(-1); return true;
+      case K.CHDOWN: pageJump(1); return true;
+    }
+    return false;
+  }
+  function playbackKey(code) {
+    var a = api();
+    if (!a) return false;
+    switch (code) {
+      case K.PLAYPAUSE: a.toggle(); break;
+      case K.PLAY: a.play(); break;
+      case K.PAUSE: a.pause(); break;
+      case K.FF: seekBy(1, CFG.seekStepBig, mode === 'controls'); return true;
+      case K.RW: seekBy(-1, CFG.seekStepBig, mode === 'controls'); return true;
+      case K.STOP: a.pause(); exitWatch(); return true;
+      case K.RED: case K.CAPTION: openPlayerMenu(RE_CC, 'subtitles'); return true;
+      case K.GREEN: openPlayerMenu(RE_SETTINGS, 'quality/settings'); return true;
+      case K.YELLOW: case K.NEXT: case K.CHUP: episode(1); return true;
+      case K.PREV: case K.CHDOWN: episode(-1); return true;
+      case K.BLUE: showHelp(); return true;
+      default: return false;
+    }
+    if (mode === 'watch') osd(true);
+    return true;
+  }
+  function watchKey(code, e) {
+    if (!ensurePlayer()) { exitWatch(); return true; }
+    switch (code) {
+      case K.OK: api().toggle(); osd(true); return true;
+      case K.LEFT: seekBy(-1); return true;
+      case K.RIGHT: seekBy(1); return true;
+      case K.UP: case K.DOWN: enterControls(); return true;
+      case K.INFO: osd(true, 6000); return true;
+      case K.BACK: exitWatch(); return true;
+    }
+    return playbackKey(code);
+  }
+  function controlsKey(code, e) {
+    if (!ensurePlayer()) { exitWatch(); return true; }
+    wake();
+    switch (code) {
+      case K.LEFT: move('left', e); return true;
+      case K.RIGHT: move('right', e); return true;
+      case K.UP: move('up', e); return true;
+      case K.DOWN: move('down', e); return true;
+      case K.OK:
+        if (focusEl && attached(focusEl) && shown(focusEl)) {
+          // clicking a seek bar would jump to wherever its middle is: go back to watching instead
+          if (!traps.length && isSeekBar(focusEl)) { leaveControls(); osd(true); toast('\u25c0 \u25b6 skip while watching'); }
+          else activate(focusEl);
+        } else refocus();
+        return true;
+      case K.BACK:
+        pruneTraps();
+        if (traps.length) closeTop(); else leaveControls();
+        return true;
+      case K.INFO: showHelp(); return true;
+    }
+    return playbackKey(code);
+  }
+  function frameKey(code, e) {
+    if (!frameEl || !attached(frameEl)) { frameEl = null; mode = 'page'; return pageKey(code, e); }
+    postTo(frameEl.contentWindow, { mbtv: 'key', code: code, repeat: !!(e && e.repeat) });
+    return true;
+  }
+  function handle(code, e) {
+    if (panel) return panelKey(code);
+    if (mode === 'frame') return frameKey(code, e);
+    if (mode === 'watch') return watchKey(code, e);
+    if (mode === 'controls') return controlsKey(code, e);
+    if (mode === 'idle') return false;
+    return pageKey(code, e);
+  }
+  function dispatchCode(code, e) {
+    scanId++;
+    lastKey = now();
+    try { return handle(code, e); } catch (err) { log(err); return false; }
+  }
+  function norm(e) {
+    var c = e.keyCode || e.which;
+    switch (c) {
+      case 27: return K.BACK;
+      case 8: return typing() ? 0 : K.BACK;
+      case 33: return K.CHUP;
+      case 34: return K.CHDOWN;
+      case 32: return (mode === 'watch' && !typing()) ? K.PLAYPAUSE : 0;
+    }
+    if (!typing() && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      // keyboard stand-ins for the colour keys, handy when testing on a computer
+      switch (c) { case 82: return K.RED; case 71: return K.GREEN; case 89: return K.YELLOW; case 66: return K.BLUE; case 73: return K.INFO; case 75: return K.PLAYPAUSE; }
+    }
+    return KNOWN[c] ? c : 0;
+  }
+  function stop(e) { e.preventDefault(); e.stopPropagation(); if (e.stopImmediatePropagation) e.stopImmediatePropagation(); }
+  function onKeyDown(e) {
+    if (e.isTrusted === false || e.__mbtv) return;   // ignore events we (or the site) synthesise
+    var code = norm(e);
+    if (!code) return;
+    if (!IS_TOP && !frameActive) {
+      // an iframe grabbed the focus without being asked: hand the key back to the page
+      if (typing()) return;
+      postParent({ mbtv: 'reclaim', code: code });
+      stop(e); return;
+    }
+    if (mode === 'idle') return;
+    if (dispatchCode(code, e)) { handledKeys[e.keyCode] = true; stop(e); }
+  }
+  function onKeyOther(e) {
+    if (e.isTrusted === false || e.__mbtv || !handledKeys[e.keyCode]) return;
+    if (e.type === 'keyup') delete handledKeys[e.keyCode];
+    stop(e);
+  }
+
+  // ------------------------------------------------------------------ overlay UI
+  var STYLE = [
+    '#mbtv-ui,#mbtv-ui *{box-sizing:border-box!important;}',
+    '#mbtv-ui{position:fixed!important;left:0!important;top:0!important;width:0!important;height:0!important;overflow:visible!important;',
+    'z-index:2147483647!important;pointer-events:none!important;margin:0!important;padding:0!important;border:0!important;',
+    'font-family:SamsungOne,"Samsung One","Samsung Sharp Sans",Roboto,"Helvetica Neue",Arial,sans-serif!important;',
+    'visibility:visible!important;opacity:1!important;transform:none!important;}',
+    '#mbtv-ui .mbtv-ring{position:fixed;display:none;border:4px solid #3ea6ff;border-radius:10px;',
+    'box-shadow:0 0 0 3px rgba(0,0,0,.55),0 0 24px 4px rgba(62,166,255,.7);',
+    'transition:left .12s ease-out,top .12s ease-out,width .12s ease-out,height .12s ease-out;}',
+    '#mbtv-ui .mbtv-osd{position:fixed;left:0;right:0;bottom:0;display:none;padding:80px 72px 46px;color:#fff;',
+    'background:linear-gradient(rgba(0,0,0,0),rgba(0,0,0,.88));}',
+    '#mbtv-ui .mbtv-osd-row{display:flex;align-items:center;font-size:30px;line-height:1.3;}',
+    '#mbtv-ui .mbtv-osd-state{width:58px;font-size:32px;}',
+    '#mbtv-ui .mbtv-osd-title{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding-right:24px;}',
+    '#mbtv-ui .mbtv-osd-bar{position:relative;height:8px;margin-top:18px;background:rgba(255,255,255,.25);border-radius:4px;}',
+    '#mbtv-ui .mbtv-osd-fill{position:absolute;left:0;top:0;bottom:0;background:#3ea6ff;border-radius:4px;}',
+    '#mbtv-ui .mbtv-osd-mark{position:absolute;top:-8px;width:4px;height:24px;margin-left:-2px;background:#fff;border-radius:2px;display:none;}',
+    '#mbtv-ui .mbtv-osd-hint{margin-top:16px;font-size:20px;color:rgba(255,255,255,.72);}',
+    '#mbtv-ui .mbtv-toast{position:fixed;top:44px;right:44px;max-width:780px;padding:16px 26px;border-radius:14px;',
+    'background:rgba(20,20,24,.94);color:#fff;font-size:24px;line-height:1.35;display:none;box-shadow:0 8px 30px rgba(0,0,0,.5);}',
+    '#mbtv-ui .mbtv-panel{position:fixed;left:50%;top:50%;width:780px;margin-left:-390px;max-height:88vh;overflow:hidden;',
+    'padding:34px 40px;border-radius:20px;background:rgba(18,18,22,.97);color:#fff;display:none;',
+    'box-shadow:0 20px 60px rgba(0,0,0,.65);transform:translateY(-50%);-webkit-transform:translateY(-50%);}',
+    '#mbtv-ui .mbtv-panel h2{margin:0 0 20px;font-size:32px;font-weight:600;color:#fff;line-height:1.25;}',
+    '#mbtv-ui .mbtv-item{padding:14px 22px;margin:6px 0;border-radius:12px;font-size:26px;color:#ddd;line-height:1.3;',
+    'background:rgba(255,255,255,.06);border:3px solid transparent;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}',
+    '#mbtv-ui .mbtv-item.mbtv-sel{background:rgba(62,166,255,.22);border-color:#3ea6ff;color:#fff;}',
+    '#mbtv-ui .mbtv-more{font-size:20px;color:rgba(255,255,255,.5);text-align:center;height:24px;}',
+    '#mbtv-ui .mbtv-help{font-size:21px;line-height:1.55;color:#ddd;}',
+    '#mbtv-ui .mbtv-help h3{font-size:23px;margin:14px 0 4px;color:#3ea6ff;font-weight:600;}',
+    '#mbtv-ui .mbtv-row{display:flex;}',
+    '#mbtv-ui .mbtv-help b{flex:0 0 240px;color:#fff;font-weight:600;}',
+    '#mbtv-ui .mbtv-help .mbtv-row span{flex:1;}',
+    'html.mbtv-fs-on,html.mbtv-fs-on body{overflow:hidden!important;}',
+    'html.mbtv-fs-on .mbtv-fs-hide{visibility:hidden!important;}',
+    'html.mbtv-fs-on .mbtv-fs-chain{transform:none!important;-webkit-transform:none!important;filter:none!important;',
+    '-webkit-filter:none!important;perspective:none!important;contain:none!important;will-change:auto!important;animation:none!important;}',
+    'html.mbtv-fs-on .mbtv-fs.mbtv-fs{position:fixed!important;left:0!important;top:0!important;right:auto!important;bottom:auto!important;',
+    'width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;min-width:0!important;',
+    'min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;',
+    'z-index:2147483000!important;background:#000!important;transform:none!important;-webkit-transform:none!important;',
+    'visibility:visible!important;opacity:1!important;}',
+    'html.mbtv-fs-on video.mbtv-fs,html.mbtv-fs-on video.mbtv-fs-inner{object-fit:contain!important;}',
+    'html.mbtv-fs-on .mbtv-fs-inner.mbtv-fs-inner{width:100%!important;height:100%!important;max-width:none!important;',
+    'max-height:none!important;min-width:0!important;min-height:0!important;margin:0!important;transform:none!important;}'
+  ].join('');
+  function mk(tag, className, parent) {
+    var n = D.createElement(tag);
+    if (className) n.className = className;
+    if (parent) parent.appendChild(n);
+    return n;
+  }
+  function buildUI() {
+    if (!D.getElementById('mbtv-style')) {
+      var st = D.createElement('style');
+      st.id = 'mbtv-style';
+      st.appendChild(D.createTextNode(STYLE));
+      (D.head || D.documentElement).appendChild(st);
+    }
+    var root = mk('div', '', null);
+    root.id = 'mbtv-ui';
+    root.setAttribute('aria-hidden', 'true');
+    ui.root = root;
+    ui.ring = mk('div', 'mbtv-ring', root);
+    ui.osd = mk('div', 'mbtv-osd', root);
+    var row = mk('div', 'mbtv-osd-row', ui.osd);
+    ui.osdState = mk('span', 'mbtv-osd-state', row);
+    ui.osdTitle = mk('span', 'mbtv-osd-title', row);
+    ui.osdTime = mk('span', 'mbtv-osd-time', row);
+    var bar = mk('div', 'mbtv-osd-bar', ui.osd);
+    ui.osdFill = mk('div', 'mbtv-osd-fill', bar);
+    ui.osdMark = mk('div', 'mbtv-osd-mark', bar);
+    ui.osdHint = mk('div', 'mbtv-osd-hint', ui.osd);
+    ui.osdHint.textContent = 'OK pause  \u00b7  \u25c0 \u25b6 skip  \u00b7  \u25b2\u25bc player controls (subtitles, quality)  \u00b7  Back exit full screen';
+    ui.toast = mk('div', 'mbtv-toast', root);
+    ui.panel = mk('div', 'mbtv-panel', root);
+    D.body.appendChild(root);
+  }
+  function drawRing() {
+    var ring = ui.ring;
+    if (!ring) return;
+    if (ui.root && !attached(ui.root)) (fsElement() && fsElement().tagName !== 'VIDEO' ? fsElement() : D.body).appendChild(ui.root);
+    if (!focusEl || !attached(focusEl) || mode === 'watch' || mode === 'frame' || mode === 'idle') { ring.style.display = 'none'; return; }
+    var r = rect(focusEl);
+    if (r.w < 1 || r.h < 1) { ring.style.display = 'none'; return; }
+    var pad = 4;
+    ring.style.display = 'block';
+    ring.style.left = Math.round(r.l - pad) + 'px';
+    ring.style.top = Math.round(r.t - pad) + 'px';
+    ring.style.width = Math.round(r.w + pad * 2) + 'px';
+    ring.style.height = Math.round(r.h + pad * 2) + 'px';
+  }
+  var ringQueued = false;
+  function drawRingSoon() {
+    if (ringQueued) return;
+    ringQueued = true;
+    (W.requestAnimationFrame || function (f) { setTimeout(f, 16); })(function () { ringQueued = false; drawRing(); });
+  }
+  function pageTitle() {
+    var t = (D.title || '').split(/\s[-|\u2013\u2014]\s/)[0];
+    if (!t || t.length < 2) { var h = D.querySelector('h1'); t = h ? shortText(h) : ''; }
+    return t;
+  }
+  function osd(show, ms) {
+    if (!ui.osd || !show) return;
+    if (mode === 'controls') return;
+    renderOSD();
+    ui.osd.style.display = 'block';
+    clearTimeout(osdTimer);
+    if (!osdTick) osdTick = setInterval(renderOSD, 500);
+    osdTimer = setTimeout(hideOSD, ms || CFG.osdTimeout);
+  }
+  function hideOSD() {
+    if (ui.osd) ui.osd.style.display = 'none';
+    clearInterval(osdTick); osdTick = null; clearTimeout(osdTimer);
+  }
+  function renderOSD() {
+    var v = video;
+    if (!v || !ui.osd) return;
+    var a = html5(v), t = a.time(), d = a.duration(), tgt = sk.target;
+    ui.osdState.textContent = v.paused ? '\u275a\u275a' : '\u25b6';
+    ui.osdTitle.textContent = pageTitle();
+    var at = tgt !== null ? tgt : t, txt = fmt(at) + (d ? ' / ' + fmt(d) : '');
+    if (tgt !== null) txt += '   (' + (tgt >= t ? '+' : '\u2212') + fmt(Math.abs(tgt - t)) + ')';
+    ui.osdTime.textContent = txt;
+    ui.osdFill.style.width = (d ? clamp(t / d, 0, 1) * 100 : 0) + '%';
+    if (tgt !== null && d) { ui.osdMark.style.display = 'block'; ui.osdMark.style.left = (clamp(tgt / d, 0, 1) * 100) + '%'; }
+    else ui.osdMark.style.display = 'none';
+  }
+  function toast(msg, ms) {
+    if (!ui.toast) return;
+    ui.toast.textContent = msg;
+    ui.toast.style.display = 'block';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { ui.toast.style.display = 'none'; }, ms || 2400);
+  }
+  function openPanel(title, items, kind, html) {
+    panel = { title: title, items: items || [], idx: 0, kind: kind, html: html || '' };
+    for (var i = 0; i < panel.items.length; i++) if (panel.items[i].selected) panel.idx = i;
+    renderPanel();
+  }
+  function closePanel() {
+    panel = null;
+    if (ui.panel) { ui.panel.style.display = 'none'; ui.panel.innerHTML = ''; }
+  }
+  function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function renderPanel() {
+    if (!panel || !ui.panel) return;
+    var h = '<h2>' + esc(panel.title) + '</h2>';
+    if (panel.kind === 'help') h += panel.html;
+    else {
+      var n = panel.items.length, max = 8, start = clamp(panel.idx - 3, 0, Math.max(0, n - max));
+      h += '<div class="mbtv-more">' + (start > 0 ? '\u25b2' : '') + '</div>';
+      for (var i = start; i < Math.min(n, start + max); i++) {
+        h += '<div class="mbtv-item' + (i === panel.idx ? ' mbtv-sel' : '') + '">' + esc(panel.items[i].label) + '</div>';
+      }
+      h += '<div class="mbtv-more">' + (start + max < n ? '\u25bc' : '') + '</div>';
+    }
+    ui.panel.innerHTML = h;
+    ui.panel.style.display = 'block';
+  }
+  function panelKey(code) {
+    if (panel.kind === 'help') { closePanel(); return true; }
+    var n = panel.items.length;
+    switch (code) {
+      case K.UP: if (n) { panel.idx = (panel.idx + n - 1) % n; renderPanel(); } return true;
+      case K.DOWN: if (n) { panel.idx = (panel.idx + 1) % n; renderPanel(); } return true;
+      case K.OK:
+        var it = panel.items[panel.idx];
+        closePanel();
+        if (it && it.run) it.run();
+        return true;
+      case K.BACK: case K.RED: closePanel(); return true;
+    }
+    return true;
+  }
+  function openQuick(atRoot) {
+    var items = [], site = onSite();
+    for (var i = 0; i < CFG.quick.length; i++) (function (q) {
+      if (!site && q.action) return;
+      items.push({ label: q.label, run: function () { if (q.action === 'search') focusSearch(); else goTo(q.url); } });
+    })(CFG.quick[i]);
+    items.push({ label: 'Remote help', run: showHelp });
+    items.push({ label: 'Exit', run: exitApp });
+    openPanel(atRoot ? 'Nothing more to go back to' : 'Menu', items, 'menu');
+  }
+  function showHelp() {
+    var watch = '<h3>Watching</h3>' +
+      '<div class=\"mbtv-row\"><b>OK, Play/Pause</b><span>Play or pause</span></div>' +
+      '<div class=\"mbtv-row\"><b>\u25c0 \u25b6</b><span>Skip 10 s (keep pressing for bigger jumps)</span></div>' +
+      '<div class=\"mbtv-row\"><b>\u25b2 \u25bc</b><span>The player\'s own controls (subtitles, sync, quality)</span></div>' +
+      '<div class=\"mbtv-row\"><b>FF / RW</b><span>Skip 30 s</span></div>' +
+      '<div class=\"mbtv-row\"><b>Red / Green</b><span>Subtitles menu / Quality and settings</span></div>' +
+      '<div class=\"mbtv-row\"><b>Yellow, CH+ / CH\u2212</b><span>Next / previous episode</span></div>' +
+      '<div class=\"mbtv-row\"><b>Back</b><span>Close menu, hide controls, leave full screen</span></div>';
+    var browse = '<h3>Browsing</h3>' +
+      '<div class=\"mbtv-row\"><b>\u25c0 \u25b2 \u25bc \u25b6, OK</b><span>Move and select</span></div>' +
+      '<div class=\"mbtv-row\"><b>Back</b><span>Go back or close a popup</span></div>' +
+      '<div class=\"mbtv-row\"><b>Red</b><span>Menu (home, history, favorites, sign in)</span></div>' +
+      '<div class=\"mbtv-row\"><b>Green / Yellow</b><span>Search / History</span></div>' +
+      '<div class=\"mbtv-row\"><b>CH+ / CH\u2212</b><span>Page up / down</span></div>' +
+      '<div class=\"mbtv-row\"><b>Blue or Info</b><span>This help</span></div>';
+    var inPlayer = mode === 'watch' || mode === 'controls';
+    openPanel('Remote controls', [], 'help', '<div class="mbtv-help">' + (inPlayer ? watch + browse : browse + watch) +
+      '<div style="margin-top:14px;color:rgba(255,255,255,.55)">Press any key to close</div></div>');
+  }
+
+  // ------------------------------------------------------------------ start-up
+  function registerKeys() {
+    try {
+      if (W.tizen && W.tizen.tvinputdevice) {
+        for (var i = 0; i < TV_KEYS.length; i++) { try { W.tizen.tvinputdevice.registerKey(TV_KEYS[i]); } catch (e) {} }
+      }
+    } catch (e2) {}
+  }
+  function patchOpen() {
+    var orig = W.open;
+    W.open = function (url) {
+      try {
+        if (url) {
+          var a = D.createElement('a');
+          a.href = url;
+          if (a.host === location.host) { savePos(); location.href = a.href; return W; }
+        }
+      } catch (e) {}
+      return orig ? orig.apply(W, arguments) : null;
+    };
+  }
+  function observe() {
+    if (!W.MutationObserver) return;
+    var mo = new W.MutationObserver(function (records) {
+      for (var i = 0; i < records.length; i++) {
+        if (!ui.root || !ui.root.contains(records[i].target)) { dirty = true; return; }
+      }
+    });
+    mo.observe(D.body, { childList: true, subtree: true, attributes: true,
+      attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'aria-expanded', 'open', 'disabled'] });
+  }
+  function start() {
+    if (!D.body) { setTimeout(start, 50); return; }
+    buildUI();
+    W.addEventListener('keydown', onKeyDown, true);
+    W.addEventListener('keyup', onKeyOther, true);
+    W.addEventListener('keypress', onKeyOther, true);
+    W.addEventListener('message', onMessage, false);
+    W.addEventListener('scroll', drawRingSoon, true);
+    W.addEventListener('resize', function () { markDirty(); drawRingSoon(); }, false);
+    D.addEventListener('fullscreenchange', onFSChange, false);
+    D.addEventListener('webkitfullscreenchange', onFSChange, false);
+    D.addEventListener('playing', onPlaying, true);
+    W.addEventListener('pagehide', function () { leaving = true; savePos(); }, false);
+    W.addEventListener('beforeunload', function () { leaving = true; savePos(); }, false);
+    W.addEventListener('pageshow', function () { leaving = false; markDirty(); drawRing(); }, false);
+    observe();
+    setInterval(drawRing, 300);
+    registerKeys();
+    if (IS_TOP) {
+      patchOpen();
+      setTimeout(function () {
+        if (focusEl || mode !== 'page') return;
+        if (!restorePos()) setTimeout(function () { if (!focusEl && mode === 'page') { markDirty(); refocus(); } }, 250);
+      }, 250);
+      try {
+        if (!W.sessionStorage.getItem('mbtv:hello')) {
+          W.sessionStorage.setItem('mbtv:hello', '1');
+          setTimeout(function () { toast('Remote mode on. Press Blue or Info for the controls.', 4000); }, 900);
+        }
+      } catch (e) {}
+    } else {
+      mode = 'idle';
+    }
+    W.__mbtv = {
+      version: '1.0.0', cfg: CFG,
+      state: function () { return { mode: mode, focus: focusEl, traps: traps.length, video: video, box: box, panel: panel ? panel.kind : null }; }
+    };
+  }
+  function boot() {
+    var root = D.documentElement;
+    if (!root) { setTimeout(boot, 30); return; }
+    if (root.getAttribute('data-mbtv')) return;   // already running in this document
+    root.setAttribute('data-mbtv', IS_TOP ? 'top' : 'frame');
+    if (D.readyState === 'loading') D.addEventListener('DOMContentLoaded', start, false);
+    else start();
+  }
+  boot();
+})();
