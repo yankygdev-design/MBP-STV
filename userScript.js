@@ -31,6 +31,12 @@
     fullscreen: 'pseudo',   // 'pseudo' fills the screen with the player (reliable on TVs); 'native' tries the Fullscreen API first
     controlsTimeout: 7000,  // ms without a key before the player's controls are dismissed
     osdTimeout: 2500,
+    // The site opens at whatever rung it last used, which is often 360p even when a 1080p
+    // one is sitting in the menu. Pick the best the TV can actually take, once per title.
+    quality: 'high',        // 'high' best rung within the limits below | 'auto' the site's adaptive rung | 'off' leave it alone
+    qualityMax: 1080,       // don't climb past this: a 2017 panel's browser is happiest at 1080p H.264
+    qualityMaxMbps: 14,     // and don't take an original file above this, however it is labelled
+    qualityHevc: false,     // HEVC / AV1 / VP9 in the TV browser is a coin toss, so skip those rungs
     homeURL: 'https://www.movieboxpro.app/',
     historyURL: '/index/index/history',
     siteRe: /(^|\.)movieboxpro\./i,
@@ -138,6 +144,16 @@
       settings: '.vjs-player-settings-button,.vjs-source-pill-control',
       episodes: '.vjs-episodes-button',
       next: '.vjs-next-button'
+    },
+    // The quality menu is built up front and only moved to the player root when it opens,
+    // so it can be read - and clicked - without putting a menu on the screen. Each row names
+    // the rung and spells out resolution, bitrate and codec, which is enough to choose on.
+    quality: {
+      menu: '.vjs-mbp-quality-menu',
+      item: '.vjs-mbp-quality-item',
+      title: '.vjs-mbp-quality-item-title',
+      meta: '.vjs-mbp-quality-item-meta',
+      fallback: '#qualityOptions p'   // the site's other picker, same rungs in the same order
     },
     // subtitle sync: the one setting that wants nudging mid-scene, so it gets its own keys
     delay: {
@@ -1078,6 +1094,7 @@
     if (!IS_TOP) postParent({ mbtv: 'fs', on: true });
     if (video.paused && fromKey) startPlayback();
     video.__mbtvDismissed = null;
+    qSoon();
     markDirty(); drawRing(); osd(true);
     return true;
   }
@@ -1171,6 +1188,99 @@
     if (el.tagName === 'A') { var tg = el.getAttribute('target'); if (tg && tg !== '_self') el.setAttribute('target', '_self'); }
     clickEl(el);
   }
+  // ---------------------------------------------------------------- quality
+  // Left alone, the site reopens at whatever rung it used last, and that is frequently 360p
+  // on a film that has a 1080p rung ready. This reads the menu once per title and moves up
+  // if it can. It only ever moves up: a rung the viewer picked by hand is never overridden.
+  var qd = { done: '', tries: 0, timer: null };
+  function qCfg() { return (site && site.quality) || null; }
+  function qParse(li, c) {
+    var t = li.querySelector(c.title), m = li.querySelector(c.meta);
+    var q = { el: li, name: t ? String(t.textContent || '').replace(/\s+/g, ' ') : '',
+      meta: m ? String(m.textContent || '') : '', h: 0, mbps: 0, adaptive: false, odd: false };
+    q.adaptive = /adaptive/i.test(q.meta) || /^auto$/i.test(q.name);
+    q.odd = /hevc|h\.?265|av1|vp9/i.test(q.meta);     // codecs this browser may not decode
+    // "1920x816" is a scope frame at 1080p: the short side is the one the panel has to push,
+    // and using it keeps the rungs in the right order while reading honestly against the cap
+    var res = q.meta.match(/(\d{3,5})\s*[x\u00d7]\s*(\d{3,5})/);
+    if (res) q.h = Math.min(parseInt(res[1], 10), parseInt(res[2], 10));
+    if (!q.h) { var n = q.name.match(/(\d{3,4})\s*p/i); if (n) q.h = parseInt(n[1], 10); }
+    if (!q.h && /4k|uhd|2160/i.test(q.name)) q.h = 2160;
+    var b = q.meta.match(/([\d.]+)\s*mbps/i), k = q.meta.match(/([\d.]+)\s*kbps/i);
+    if (b) q.mbps = parseFloat(b[1]); else if (k) q.mbps = parseFloat(k[1]) / 1000;
+    return q;
+  }
+  function qList() {
+    var c = qCfg();
+    if (!c || !box || !attached(box)) return [];
+    var menu = box.querySelector(c.menu) || D.querySelector(c.menu);
+    if (!menu) return [];
+    var nodes = menu.querySelectorAll(c.item), out = [], i;
+    for (i = 0; i < nodes.length; i++) out.push(qParse(nodes[i], c));
+    return out;
+  }
+  function qPicked(q) {
+    return q.el.getAttribute('aria-checked') === 'true' || /(^|\s)vjs-selected(\s|$)/.test(cls(q.el));
+  }
+  function qBest(list) {
+    var i, q, best = null;
+    if (CFG.quality === 'auto') {
+      for (i = 0; i < list.length; i++) if (list[i].adaptive) return list[i];
+    }
+    for (i = 0; i < list.length; i++) {
+      q = list[i];
+      if (q.adaptive || !q.h) continue;                 // nothing here to judge a rung by
+      if (q.h > CFG.qualityMax) continue;               // past what this panel's browser enjoys
+      if (CFG.qualityMaxMbps && q.mbps > CFG.qualityMaxMbps) continue;
+      if (q.odd && !CFG.qualityHevc) continue;
+      if (!best || q.h > best.h || (q.h === best.h && q.mbps > best.mbps)) best = q;
+    }
+    return best;
+  }
+  // One title, one attempt. Keyed on the on-screen name rather than the source, because
+  // switching rung swaps the source and would otherwise look like a fresh video to us.
+  function qKey() {
+    var t = (site && site.title && box) ? box.querySelector(site.title) : null;
+    return location.pathname + location.search + '|' + (t ? String(t.textContent || '') : '');
+  }
+  function qSoon() {
+    if (!qCfg() || CFG.quality === 'off') return;
+    clearTimeout(qd.timer);
+    qd.timer = setTimeout(applyQuality, 900);
+  }
+  function applyQuality() {
+    var c = qCfg();
+    if (!c || CFG.quality === 'off' || !ensurePlayer()) return;
+    var key = qKey();
+    if (qd.done === key) return;
+    var list = qList(), i, cur = null;
+    if (!list.length) {       // the menu is filled a moment after the stream attaches
+      if (qd.tries++ < 6) { clearTimeout(qd.timer); qd.timer = setTimeout(applyQuality, 1200); }
+      return;
+    }
+    qd.tries = 0;
+    for (i = 0; i < list.length; i++) if (qPicked(list[i])) cur = list[i];
+    var best = qBest(list);
+    qd.done = key;            // whatever happens next, don't come back at this title again
+    if (!best || (cur && cur.el === best.el)) return;
+    if (cur && !cur.adaptive && cur.h >= best.h) return;   // never step down behind the viewer
+    log('quality ' + (cur ? cur.name : '?') + ' -> ' + best.name + ' (' + best.meta + ')');
+    toast('Quality \u2192 ' + best.name);
+    clickRaw(best.el);
+    // A menu item that was never on screen may not take. The site's other picker lists the
+    // same rungs under the same names, so check and go round again rather than quietly lie.
+    setTimeout(function () {
+      var l2 = qList(), j, now2 = null;
+      for (j = 0; j < l2.length; j++) if (qPicked(l2[j])) now2 = l2[j];
+      if (now2 && now2.name === best.name) return;
+      if (!c.fallback || !box || !attached(box)) return;
+      var ps = box.querySelectorAll(c.fallback);
+      for (j = 0; j < ps.length; j++) {
+        if (String(ps[j].textContent || '').replace(/\s+/g, '') === best.name) { clickRaw(ps[j]); return; }
+      }
+    }, 2400);
+  }
+
   // ---------------------------------------------------------------- subtitle sync
   // CH+ / CH- drive the site's own delay control. Inside the player those two keys were a
   // third name for next/previous episode - Yellow and the media track keys still do that -
@@ -1243,7 +1353,9 @@
   }
   function onPlaying(e) {
     var v = e.target;
-    if (!v || v.tagName !== 'VIDEO' || !CFG.autoWatch || mode !== 'page' || panel) return;
+    if (!v || v.tagName !== 'VIDEO') return;
+    if (rect(v).w >= 240) qSoon();   // pick the rung on any real playback, watching or not
+    if (!CFG.autoWatch || mode !== 'page' || panel) return;
     if (!IS_TOP && !frameActive) return;
     if (v.__mbtvDismissed && v.__mbtvDismissed === (v.currentSrc || v.src || 'x')) return;
     if (v.muted || rect(v).w < W.innerWidth * 0.35) return;
