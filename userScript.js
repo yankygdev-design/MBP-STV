@@ -110,9 +110,15 @@
       { sel: '.clear1 li' },
       { sel: '.tv_episode', keep: 'a.start_app_episode,.operation' },
       { sel: '.search_info > a' },
-      { sel: '.lists_roll > div', keep: 'a' }
+      { sel: '.lists_roll > div', keep: 'a' },
+      // My Box's Watching row stacks five controls on one poster - cover, play, the menu,
+      // the watched tick and a tips icon. Play and the menu are the two worth a press.
+      { sel: '.watching_list li', keep: '.play,.more' }
     ],
-    tileOpen: '.tab_con',   // ...except menus that open inside a tile
+    tileOpen: '.tab_con,.operation_list',   // ...except menus that open inside a tile
+    // Menus with no close button, which the site dismisses with a click anywhere else.
+    // Re-clicking what opened one only toggles it straight back open.
+    dismiss: '.operation_list,.personal,.tab_con',
     // clickable with no href, button or onclick to show for it (jQuery handlers)
     extra: '.left,.left_show,.right,.right2,.right_show,.right_none,.lower,.filter,.elect,.elected,.elect_none,' +
       '.operation,.tab_con li,.watch_plan,.favorite,.add_list2,.comment,.like2,.dislike,.episode_like,.episode_dislike,' +
@@ -128,7 +134,12 @@
       '.bg_opacity_set p,#qualityOptions p,.mbp-resource-item,.jian,.jia,.delay_btn,.font_btn,' +
       '.translate_btn,.restart,.next_play,.replay,.close2,.back2,.left_skip,.right_skip,.apply_all,' +
       '.disable,.vjs-seek-button,.vjs-menu-item,.movie_skip_con .close span,.change2,.lang_select,' +
-      '.del_close,.mbp-resource-modal-close-btn',
+      '.del_close,.mbp-resource-modal-close-btn,' +
+      // My Box and MovieLists: the per-card menu and its items, the watched ticks, and the
+      // chips that clear one active filter - all images and paragraphs with jQuery handlers
+      '.more,.tab_watched,.watch_status,.operation_list p,.create_list,.manage_lists,' +
+      '#clear_filter,.clear_type,.clear_sort,.clear_rating,.clear_quality,.clear_year,' +
+      '.clear_genr,.clear_genre,.clear_country,.clear_tomatometer',
     // Long lists that live inside one panel each, swept only while that panel is open: the
     // language pickers run to a couple of hundred entries, and a style lookup per entry is
     // more than the oldest sets this runs on can afford on every keypress.
@@ -874,6 +885,15 @@
     if (!focusEl || !dlg.contains(focusEl)) { setFocus(pickInitial(c, dlg), { noScroll: true }); return true; }
     return false;
   }
+  // A menu the site closes by noticing a click somewhere else. Clicking its opener again would
+  // reopen it, and it has no close button of its own, so Back has to behave like that outside
+  // click instead: send one at the page root, where it reaches the site's own window handler.
+  function dismissable(box) {
+    return !!(site && site.dismiss && box && box.closest && box.closest(site.dismiss));
+  }
+  function clickAway() {
+    fire(D.documentElement, 'click', 0, 0);
+  }
   function closeTop() {
     var t = traps[traps.length - 1];
     if (!t) return;
@@ -883,6 +903,7 @@
       if (attached(t.box) && shown(t.box) && candidates(t.box).length) {
         var closer = findLabeled(t.box, RE_CLOSE);
         if (closer) clickEl(closer);
+        else if (dismissable(t.box)) clickAway();
         else if (t.opener && attached(t.opener) && !t.box.contains(t.opener) && shown(t.opener)) clickEl(t.opener);
       }
       setTimeout(function () {
