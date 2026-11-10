@@ -10,6 +10,8 @@
  * Browsing:  D-pad move | OK select | Back go back / close a popup
  *            Red menu | Green search | Yellow history | Blue or Info help
  *            CH+/CH- page up/down | Play open the player on a watch page
+ *            A row of posters is a rail: Left/Right slides it and stays in it,
+ *            Up/Down changes row. One stop per poster, not one per overlay.
  * Watching:  OK or Play/Pause play-pause | Left/Right skip 10s (keep pressing = bigger jumps)
  *            Up/Down the player's own controls (subtitles, sync, quality...)
  *            FF/RW skip 30s | Red subtitles | Green quality/settings
@@ -32,12 +34,18 @@
     homeURL: 'https://www.movieboxpro.app/',
     historyURL: '/index/index/history',
     siteRe: /(^|\.)movieboxpro\./i,
+    siteAdapters: true,     // use the per-site hints below (tiles, episode changing, player teardown)
+    hiddenScroll: true,     // treat overflow:hidden rows that overflow as scrollable (jQuery carousels)
     quick: [
       { label: 'Home', url: '/' },
       { label: 'Search', action: 'search' },
+      { label: 'Movies', url: '/movie' },
+      { label: 'TV shows', url: '/tvshow' },
+      { label: 'MovieLists', url: '/playlist' },
+      { label: 'Waiting to watch', url: '/index/index/my_box' },
       { label: 'History', url: '/index/index/history' },
       { label: 'Favorites', url: '/index/index/fav_list' },
-      { label: 'My lists', url: '/index/playlist/my_list?type=mine' },
+      { label: 'My lists', url: '/index/playlist?type=mine' },
       { label: 'Sign in with a code', url: '/index/index/tv_login' }
     ],
     debug: false
@@ -79,8 +87,140 @@
   var DIALOG_SEL = '[role="dialog"],[role="alertdialog"],[aria-modal="true"],.modal.in,.modal.show,.layui-layer,' +
     '.el-dialog__wrapper,.ant-modal-wrap,.swal2-container,.mfp-wrap,.fancybox-container';
 
+  // ------------------------------------------------------------------ site adapters
+  // A little site knowledge beats guessing: which boxes are one tile (so a poster is one
+  // stop instead of three), what is clickable without saying so, how this site changes
+  // episode, and how it tears its player down. Everything here is optional - without a
+  // match the generic scanner below behaves exactly as before.
+  var SITES = [{
+    name: 'movieboxpro',
+    test: /(^|\.)movieboxpro\./i,
+    // the whole catalogue is tiles, so the blind pointer sweep can stay near the viewport
+    sweepUp: 0.8, sweepDown: 1.8,
+    // one stop per card: posters carry a cover, a play overlay and a "tips" icon, all clickable
+    tiles: [
+      { sel: '.clear1 li' },
+      { sel: '.tv_episode', keep: 'a.start_app_episode,.operation' },
+      { sel: '.search_info > a' },
+      { sel: '.lists_roll > div', keep: 'a' }
+    ],
+    tileOpen: '.tab_con',   // ...except menus that open inside a tile
+    // clickable with no href, button or onclick to show for it (jQuery handlers)
+    extra: '.left,.left_show,.right,.right2,.right_show,.right_none,.lower,.filter,.elect,.elected,.elect_none,' +
+      '.operation,.tab_con li,.watch_plan,.favorite,.add_list2,.comment,.like2,.dislike,.episode_like,.episode_dislike,' +
+      '.open2,.hide,.lang_btn,.lang_list p,.sidebarbg2 li,.sidebarcon2 .close img,.season_waiting,.watch_progress,' +
+      '.episode,.spread_episode,.off_episode,.add_fav_waiting,.add_fav_watched,.create_playlist,.popup_close,.fav_close,' +
+      '.newlist_back,.newlist_close,.tips_close,.search_close,.search_submit,.search_submit2,.player-option,.radio,' +
+      '.quit,.confirm,.turn_on,.manage_lists,.set_lists,#dialog_close,.video_player_close,.del_all,.sort,.back,' +
+      '.player_back,.user_more_operation,.report,.block,.delete,.send,.list_scroll p,.translate_lang_list p,' +
+      '.letter_list a,.checkbox label,.del_subtitle_con .btn p,.screenbg .close,.season_con .close2,' +
+      // inside the player: its panels are plain divs and list items with jQuery handlers
+      '.subtitle_con .right2 li,.subtitle_con .off,.subtitle_con .more,.lang_more,.srt_set,.reset_srt,' +
+      '.srt_color_set p,.font_opacity_set p,.font_size_set p,.font_family_set p,.bg_color_set p,' +
+      '.bg_opacity_set p,#qualityOptions p,.mbp-resource-item,.jian,.jia,.delay_btn,.font_btn,' +
+      '.translate_btn,.restart,.next_play,.replay,.close2,.back2,.left_skip,.right_skip,.apply_all,' +
+      '.disable,.vjs-seek-button',
+    // the player is video.js 8 with the site's own skin, so its controls can be named outright
+    // instead of guessed at: far more reliable than matching labels, and it skips the retry loop
+    player: {
+      subtitles: '.vjs-cc-button',
+      // the quality pill's clickable is the inner control, not the wrapper div
+      settings: '.vjs-source-pill-control,.vjs-player-settings-button',
+      next: '.vjs-next-button'
+    },
+    title: '.vjs-mbp-title',   // names the episode on screen, which document.title does not
+    episode: mbpEpisode,
+    close: mbpClose
+  }];
+  // A named player control, if this site has one and it is on screen.
+  function playerBtn(key) {
+    if (!site || !site.player || !site.player[key] || !box || !attached(box)) return null;
+    var list = box.querySelectorAll(site.player[key]), i;
+    for (i = 0; i < list.length; i++) if (shownQuick(list[i])) return list[i];
+    return null;
+  }
+  function pickSite() {
+    if (!CFG.siteAdapters) return null;
+    var want = W.__mbtvForceSite;   // set before load to try an adapter on a saved copy of a page
+    for (var i = 0; i < SITES.length; i++) {
+      if (want ? SITES[i].name === want : SITES[i].test.test(location.hostname)) return SITES[i];
+    }
+    return null;
+  }
+  // Click without aiming: used for the site's own buttons, which may be hidden behind an overlay.
+  function clickRaw(el) {
+    if (!el) return false;
+    try { if (typeof el.click === 'function') { el.click(); return true; } } catch (e) {}
+    var c = center(el);
+    fire(el, 'click', c.x, c.y);
+    return true;
+  }
+  // Which episode is on screen: the site leaves it in globals, the play button, or the URL.
+  function mbpPlaying() {
+    var s = parseInt(W.play_season, 10), e = parseInt(W.play_episode, 10), m, m2;
+    if (s > 0 && e > 0) return { s: s, e: e };
+    var a = D.querySelector('.play_btn[play],.start_app[play]');
+    if (a) {
+      m = /season=(\d+)[\s\S]*?episode=(\d+)/.exec(a.getAttribute('play') || '');
+      if (m) return { s: parseInt(m[1], 10), e: parseInt(m[2], 10) };
+    }
+    m = /[?&]season=(\d+)/.exec(location.search);
+    m2 = /[?&]episode=(\d+)/.exec(location.search);
+    if (m && m2) return { s: parseInt(m[1], 10), e: parseInt(m2[1], 10) };
+    return null;
+  }
+  // The watch-plan panel lists every season, so a neighbouring season's length is in the page.
+  function mbpLastEpisode(season) {
+    var list = D.querySelectorAll('.season_info[season="' + season + '"] .episode');
+    if (!list.length) return 0;
+    return parseInt(list[list.length - 1].getAttribute('episode'), 10) || 0;
+  }
+  function mbpSeasonExists(season) {
+    return !!D.querySelector('.season_info[season="' + season + '"],.season_list2 a[href$="season=' + season + '"]');
+  }
+  // No next/prev buttons on this site: episodes are a grid, so work out the neighbour ourselves.
+  function mbpEpisode(dir) {
+    if (!/\/tvshow\//.test(location.pathname)) return false;
+    var cur = mbpPlaying();
+    if (!cur) return false;
+    // the grid on screen must be the season we are watching, or we would be counting someone else's
+    if (!D.querySelector('.tv_episode a.start_app_episode[season="' + cur.s + '"]')) return false;
+    var e = cur.e + dir, el = null;
+    if (e > 0) el = D.querySelector('.tv_episode a.start_app_episode[season="' + cur.s + '"][episode="' + e + '"]');
+    if (el) {
+      toast(dir > 0 ? 'Next episode' : 'Previous episode');
+      exitWatch();                                    // dispose the open player first, saving progress
+      setTimeout(function () { clickRaw(el); }, 320); // the site then builds a fresh one
+      return true;
+    }
+    var ns = cur.s + dir;
+    if (ns < 1 || !mbpSeasonExists(ns)) return false;
+    var ne = dir > 0 ? 1 : mbpLastEpisode(ns);
+    if (!ne) return false;
+    toast('Season ' + ns + ', episode ' + ne);
+    exitWatch();
+    goTo(location.pathname + '?season=' + ns + '&episode=' + ne + '&play=1');
+    return true;
+  }
+  // Let the site close its own player: that saves the position and disposes video.js/JW properly.
+  function mbpClose(v) {
+    var c;
+    if (v && v === D.getElementById('video_player')) {   // trailer overlay
+      c = D.querySelector('.video_player_close');
+      if (c) return clickRaw(c);
+    }
+    var host = D.getElementById('my_dialog');
+    if (host && v && host.contains(v)) {
+      try { v.pause(); } catch (e) {}
+      c = D.getElementById('dialog_close');
+      if (c) return clickRaw(c);
+    }
+    return false;
+  }
+
   // ------------------------------------------------------------------ state
   var IS_TOP = (function () { try { return W.top === W; } catch (e) { return false; } })();
+  var site = null;              // matched entry from SITES, if any
   var mode = 'page';            // page | watch | controls | frame | idle
   var focusEl = null;
   var traps = [];               // open popups/menus that hold the focus: { opener, box }
@@ -89,7 +229,7 @@
   var panel = null;             // open help / menu / picker
   var handledKeys = {};
   var lastKey = 0, lastMove = 0;
-  var dirty = true, cache = null, scanSeq = 0, scanId = 0;
+  var dirty = true, caches = [], scanSeq = 0, scanId = 0;
   var frameEl = null;           // top window: iframe that currently gets the keys
   var frameActive = false;      // inside an iframe: the parent page handed us the keys
   var pseudo = { el: null, chain: [], hidden: [], inner: [], sy: 0 };
@@ -147,12 +287,12 @@
   }
 
   // ------------------------------------------------------------------ visibility
-  function hiddenByOpacity(el) {
+  function hiddenByOpacity(el, s0) {
     var n = el, path = [], res = false, i;
     while (n && n.nodeType === 1) {
       if (n.__mbtvOpS === scanId) { res = n.__mbtvOp; break; }
       path.push(n);
-      var s = css(n);
+      var s = (n === el && s0) ? s0 : css(n);
       if (s.display === 'none' || parseFloat(s.opacity) < 0.05) { res = true; break; }
       n = n.parentElement;
     }
@@ -162,25 +302,52 @@
   function shown(el, r) {
     r = r || rect(el);
     if (r.w < 2 || r.h < 2) return false;
-    var v = css(el).visibility;
+    var s = css(el), v = s.visibility;    // one style lookup, shared with the opacity walk
     if (v === 'hidden' || v === 'collapse') return false;
-    return !hiddenByOpacity(el);
+    return !hiddenByOpacity(el, s);
   }
   function shownQuick(el) { return attached(el) && shown(el); }
-  // Off-screen items inside an overflow:hidden box (sliding carousels) can't be reached by scrolling: skip them.
+  // How a box clips and scrolls its children. Rows share ancestors, so cache it per scan:
+  // this is the hottest style lookup there is (every candidate walks its whole chain).
+  function ovf(n) {
+    if (n.__mbtvOvS === scanId) return n.__mbtvOv;
+    var s = css(n), ox = s.overflowX, oy = s.overflowY;
+    var o = {
+      fixed: s.position === 'fixed',
+      visible: ox === 'visible' && oy === 'visible',
+      // a jQuery carousel is overflow:hidden yet scrolls fine when you set scrollLeft
+      sx: ox === 'auto' || ox === 'scroll' || (CFG.hiddenScroll && ox === 'hidden' && n.scrollWidth > n.clientWidth + 1),
+      sy: oy === 'auto' || oy === 'scroll' || (CFG.hiddenScroll && oy === 'hidden' && n.scrollHeight > n.clientHeight + 1),
+      r: rect(n)
+    };
+    n.__mbtvOvS = scanId; n.__mbtvOv = o;
+    return o;
+  }
+  // The row an element sits in, if any: a carousel is a rail, so Left/Right should stay inside it.
+  function scrollerOf(el) {
+    if (el.__mbtvScrS === scanId) return el.__mbtvScr;
+    var n = el.parentElement, res = null;
+    while (n && n !== D.body && n !== D.documentElement) {
+      var o = ovf(n);
+      if (o.sx && n.scrollWidth > n.clientWidth + 1) { res = n; break; }
+      if (o.fixed) break;
+      n = n.parentElement;
+    }
+    el.__mbtvScrS = scanId; el.__mbtvScr = res;
+    return res;
+  }
+  // Off-screen items in a box that cannot scroll can't be reached at all: skip them.
   function clipped(el, r) {
     var n = el.parentElement;
     while (n && n !== D.body && n !== D.documentElement) {
-      var s = css(n);
-      if (s.position === 'fixed') return false;
-      var ox = s.overflowX, oy = s.overflowY;
-      if (ox !== 'visible' || oy !== 'visible') {
-        var sx = ox === 'auto' || ox === 'scroll', sy = oy === 'auto' || oy === 'scroll';
-        var p = rect(n);
+      var o = ovf(n);
+      if (o.fixed) return false;
+      if (!o.visible) {
+        var p = o.r;
         if (p.w < 2 || p.h < 2) return true;
-        if (!sx && Math.min(r.r, p.r) - Math.max(r.l, p.l) < Math.min(r.w, p.w) * 0.6) return true;
-        if (!sy && Math.min(r.b, p.b) - Math.max(r.t, p.t) < Math.min(r.h, p.h) * 0.6) return true;
-        if (sx || sy) return false;
+        if (!o.sx && Math.min(r.r, p.r) - Math.max(r.l, p.l) < Math.min(r.w, p.w) * 0.6) return true;
+        if (!o.sy && Math.min(r.b, p.b) - Math.max(r.t, p.t) < Math.min(r.h, p.h) * 0.6) return true;
+        if (o.sx || o.sy) return false;
       }
       n = n.parentElement;
     }
@@ -200,33 +367,104 @@
       !el.getAttribute('role') && !el.hasAttribute('onclick')) return false;
     return true;
   }
+  // Is this node part of a tile we already collapsed to a single stop?
+  function inTile(el, stamp) {
+    var n = el.parentElement, d = 0;
+    while (n && d++ < 10) {
+      if (n.__mbtvTile === stamp) {
+        return !(site.tileOpen && el.closest && el.closest(site.tileOpen));   // a menu inside a tile still counts
+      }
+      n = n.parentElement;
+    }
+    return false;
+  }
+  // display:none and not-yet-built nodes have no box. Dropping those from the adapter's list keeps
+  // them out of the per-keypress pass - a TV show page hides hundreds of watch-plan rows. Safe here
+  // because this site reveals them with a class or style change, which marks the scan dirty.
+  // Not applied to links and buttons, which a site may reveal on hover alone.
+  function laidOut(el) {
+    var r = el.getBoundingClientRect();
+    return r.width >= 4 && r.height >= 4;
+  }
+  // One stop per tile: the tile itself, or the first match of each keep selector.
+  function tileKeeps(t, keep) {
+    if (!keep) return [t];
+    var toks = keep.split(','), out = [], i, el;
+    for (i = 0; i < toks.length; i++) {
+      el = t.querySelector(toks[i]);
+      if (el) out.push(el);
+    }
+    return out.length ? out : [t];
+  }
   function rescan(scope) {
-    var list = [], i, el, stamp = ++scanSeq, vh = W.innerHeight;
-    var nodes = scope.querySelectorAll(SEMANTIC);
+    var list = [], i, j, el, stamp = ++scanSeq, vh = W.innerHeight;
+    var tiles = site && site.tiles, nodes, keeps;
+    if (tiles) {
+      for (i = 0; i < tiles.length; i++) {
+        nodes = scope.querySelectorAll(tiles[i].sel);
+        for (j = 0; j < nodes.length; j++) {
+          el = nodes[j];
+          if (el.__mbtvTile === stamp || inUI(el)) continue;
+          el.__mbtvTile = stamp;
+          keeps = tileKeeps(el, tiles[i].keep);
+          for (var k = 0; k < keeps.length; k++) {
+            if (keeps[k].__mbtvCand === stamp) continue;
+            keeps[k].__mbtvCand = stamp;
+            list.push(keeps[k]);
+          }
+        }
+      }
+    }
+    nodes = scope.querySelectorAll(SEMANTIC);
     for (i = 0; i < nodes.length; i++) {
       el = nodes[i];
+      if (el.__mbtvCand === stamp) continue;
+      if (tiles && inTile(el, stamp)) continue;
       if (okSemantic(el)) { el.__mbtvCand = stamp; list.push(el); }
     }
-    // div/span "buttons" that only reveal themselves through cursor: pointer
+    // things this site makes clickable with a jQuery handler and nothing else to show for it
+    if (site && site.extra) {
+      nodes = scope.querySelectorAll(site.extra);
+      for (i = 0; i < nodes.length; i++) {
+        el = nodes[i];
+        if (el.__mbtvCand === stamp || inUI(el)) continue;
+        if (tiles && inTile(el, stamp)) continue;
+        if (!laidOut(el)) continue;
+        el.__mbtvCand = stamp; list.push(el);
+      }
+    }
+    // div/span "buttons" that only reveal themselves through cursor: pointer. The style lookup is
+    // the expensive part, so skip tile innards and stay near the viewport when a site adapter ran.
+    var up = (site && site.sweepUp) || 2.5, down = (site && site.sweepDown) || 3.5;
     var pts = scope.querySelectorAll(POINTER_TAGS);
     for (i = 0; i < pts.length; i++) {
       el = pts[i];
       if (el.__mbtvCand === stamp || inUI(el)) continue;
+      if (tiles && inTile(el, stamp)) continue;
       var r = el.getBoundingClientRect();
-      if (r.width < 10 || r.height < 10 || r.bottom < -vh * 2.5 || r.top > vh * 3.5) continue;
+      if (r.width < 10 || r.height < 10 || r.bottom < -vh * up || r.top > vh * down) continue;
       if (css(el).cursor !== 'pointer') continue;
       var p = el.parentElement;
       if (p && p !== scope && css(p).cursor === 'pointer') continue;
       if (p && p.closest && p.closest(CLICKY)) continue;
       el.__mbtvCand = stamp; list.push(el);
     }
-    cache = { scope: scope, list: list, sy: W.pageYOffset, t: now(), mode: mode };
+    var c = { scope: scope, list: list, sy: W.pageYOffset, t: now(), mode: mode };
+    caches.unshift(c);
+    if (caches.length > 3) caches.pop();   // page, open dialog and player box stop evicting each other
     dirty = false;
+    return c;
+  }
+  function cacheFor(scope) {
+    var c = null, i;
+    if (dirty) { caches = []; return rescan(scope); }
+    for (i = 0; i < caches.length; i++) if (caches[i].scope === scope) { c = caches[i]; break; }
+    if (c && (c.mode !== mode || Math.abs(W.pageYOffset - c.sy) > W.innerHeight * 0.6 || now() - c.t > 5000)) c = null;
+    return c || rescan(scope);
   }
   function candidates(scope) {
     scope = scope || D.body;
-    if (dirty || !cache || cache.scope !== scope || cache.mode !== mode ||
-      Math.abs(W.pageYOffset - cache.sy) > W.innerHeight * 0.6 || now() - cache.t > 5000) rescan(scope);
+    var cache = cacheFor(scope);
     scanId++;
     var out = [], vh = W.innerHeight, vw = W.innerWidth, i;
     var tile = (mode === 'page' && scope === D.body) ? playerTile() : null;
@@ -255,6 +493,7 @@
   function findNext(cur, dir, cands) {
     var c = rect(cur), ccx = c.l + c.w / 2, ccy = c.t + c.h / 2, horiz = dir === 'left' || dir === 'right';
     var best = [null, null], bestScore = [Infinity, Infinity];
+    var rail = horiz ? scrollerOf(cur) : null;   // inside a carousel, Left/Right never leaves it
     for (var i = 0; i < cands.length; i++) {
       var el = cands[i].el, r = cands[i].r;
       if (el === cur || el.contains(cur) || cur.contains(el)) continue;
@@ -284,6 +523,7 @@
       var tier;
       if (horiz) {
         if (!(overlap > 0 || ortho <= Math.max(20, c.h * 0.5))) continue;
+        if (rail && scrollerOf(el) !== rail) continue;   // don't slip into the row above or below
         tier = 0;
       } else tier = (overlap > 0 || dPri >= dOrt * 0.3) ? 0 : 1;
       var score = primary + ortho * 4 + dOrt * 0.15 - (overlap > 0 ? Math.min(overlap, 40) * 0.5 : 0);
@@ -291,7 +531,9 @@
     }
     return best[0] || best[1];
   }
+  var hdr = { at: 0, v: 0 };
   function headerOffset() {
+    if (now() - hdr.at < 500) return hdr.v;          // asked once per move: a sticky bar does not come and go
     var h = 0, els = D.querySelectorAll('header,nav,[class*="header"],[class*="nav"],[id*="header"],[class*="top"]');
     for (var i = 0; i < els.length && i < 80; i++) {
       var s = css(els[i]);
@@ -299,15 +541,16 @@
       var r = rect(els[i]);
       if (r.t <= 2 && r.b > 0 && r.b < W.innerHeight * 0.35 && r.w > W.innerWidth * 0.5) h = Math.max(h, r.b);
     }
+    hdr.at = now(); hdr.v = h;
     return h;
   }
   // Bring an element into view: inner scrollers first (rows, lists), then the page, keeping focus near the middle.
   function reveal(el) {
     var r = rect(el), n = el.parentElement;
     while (n && n !== D.body && n !== D.documentElement) {
-      var s = css(n);
-      var sx = (s.overflowX === 'auto' || s.overflowX === 'scroll') && n.scrollWidth > n.clientWidth + 1;
-      var sy = (s.overflowY === 'auto' || s.overflowY === 'scroll') && n.scrollHeight > n.clientHeight + 1;
+      var o = ovf(n);
+      var sx = o.sx && n.scrollWidth > n.clientWidth + 1;
+      var sy = o.sy && n.scrollHeight > n.clientHeight + 1;
       if (sx || sy) {
         var p = rect(n), pad = 40;
         if (sx) {
@@ -320,7 +563,7 @@
         }
         r = rect(el);
       }
-      if (s.position === 'fixed') return;
+      if (o.fixed) return;
       n = n.parentElement;
     }
     if (mode !== 'page') return;
@@ -811,12 +1054,22 @@
   function exitWatch() {
     stopControls();
     hideOSD();
-    if (video) video.__mbtvDismissed = video.currentSrc || video.src || 'x';
     pseudoFS(null, false);
     if (fsElement()) exitNativeFS();
+    // Prefer the site's own close button: it saves the watched position and disposes the player,
+    // instead of leaving it running behind the page.
+    var closed = false;
+    if (site && site.close && video && attached(video)) { try { closed = !!site.close(video); } catch (e) { log(e); } }
+    if (video && !closed) video.__mbtvDismissed = video.currentSrc || video.src || 'x';
     if (!IS_TOP) { postParent({ mbtv: 'fs', on: false }); exitFrame(); return; }
     mode = 'page'; traps = [];
     markDirty();
+    if (closed) {
+      video = null; box = null; focusEl = null;
+      drawRing();
+      setTimeout(function () { if (mode === 'page' && !focusEl) { markDirty(); refocus(); } }, 300);
+      return;
+    }
     if (box && attached(box)) setFocus(box); else refocus();
   }
   function wake() {
@@ -857,7 +1110,7 @@
     if (box && attached(box)) { var c = center(box); fire(box, 'mouseout', c.x, c.y); fire(box, 'mouseleave', c.x, c.y); }
     try { if (D.activeElement && box && box.contains(D.activeElement)) D.activeElement.blur(); } catch (e) {}
   }
-  function openPlayerMenu(re, name) {
+  function openPlayerMenu(re, name, key) {
     if (!ensurePlayer()) return;
     if (mode !== 'controls') enterControls();
     wake();
@@ -865,7 +1118,7 @@
     var go = function () {
       tries++;
       markDirty(); wake();
-      var btn = findLabeled(box, re);
+      var btn = playerBtn(key) || findLabeled(box, re);
       if (!btn) { if (tries < 3) setTimeout(go, 250); else toast('No ' + name + ' button in this player'); return; }
       setFocus(btn, { noScroll: true });
       activate(btn);
@@ -873,6 +1126,13 @@
     setTimeout(go, 260);
   }
   function episode(dir) {
+    // the player's own next button keeps playback going without a reload: much the best route
+    if (dir > 0) {
+      var nb = playerBtn('next');
+      if (nb) { toast('Next episode'); clickRaw(nb); return; }
+    }
+    // no previous button exists, and next is hidden on a season's last episode: use the grid
+    if (site && site.episode) { try { if (site.episode(dir)) return; } catch (e) { log(e); } }
     var re = dir > 0 ? RE_NEXT : RE_PREV;
     var el = (box && attached(box)) ? findLabeled(box, re) : null;
     if (!el) el = findLabeled(D.body, re, true);
@@ -1097,8 +1357,8 @@
       case K.FF: seekBy(1, CFG.seekStepBig, mode === 'controls'); return true;
       case K.RW: seekBy(-1, CFG.seekStepBig, mode === 'controls'); return true;
       case K.STOP: a.pause(); exitWatch(); return true;
-      case K.RED: case K.CAPTION: openPlayerMenu(RE_CC, 'subtitles'); return true;
-      case K.GREEN: openPlayerMenu(RE_SETTINGS, 'quality/settings'); return true;
+      case K.RED: case K.CAPTION: openPlayerMenu(RE_CC, 'subtitles', 'subtitles'); return true;
+      case K.GREEN: openPlayerMenu(RE_SETTINGS, 'quality/settings', 'settings'); return true;
       case K.YELLOW: case K.NEXT: case K.CHUP: episode(1); return true;
       case K.PREV: case K.CHDOWN: episode(-1); return true;
       case K.BLUE: showHelp(); return true;
@@ -1295,6 +1555,10 @@
     (W.requestAnimationFrame || function (f) { setTimeout(f, 16); })(function () { ringQueued = false; drawRing(); });
   }
   function pageTitle() {
+    if (site && site.title && (mode === 'watch' || mode === 'controls')) {
+      var own = D.querySelector(site.title);   // the player knows which episode is on, the page title does not
+      if (own && shortText(own)) return shortText(own);
+    }
     var t = (D.title || '').split(/\s[-|\u2013\u2014]\s/)[0];
     if (!t || t.length < 2) { var h = D.querySelector('h1'); t = h ? shortText(h) : ''; }
     return t;
@@ -1436,6 +1700,7 @@
   }
   function start() {
     if (!D.body) { setTimeout(start, 50); return; }
+    site = pickSite();
     buildUI();
     W.addEventListener('keydown', onKeyDown, true);
     W.addEventListener('keyup', onKeyOther, true);
@@ -1450,7 +1715,8 @@
     W.addEventListener('beforeunload', function () { leaving = true; savePos(); }, false);
     W.addEventListener('pageshow', function () { leaving = false; markDirty(); drawRing(); }, false);
     observe();
-    setInterval(drawRing, 300);
+    // the ring also follows scrolling and resizes: this is only a safety net for layout we miss
+    setInterval(function () { if (!D.hidden && focusEl) drawRing(); }, 600);
     registerKeys();
     if (IS_TOP) {
       patchOpen();
@@ -1468,8 +1734,11 @@
       mode = 'idle';
     }
     W.__mbtv = {
-      version: '1.0.0', cfg: CFG,
-      state: function () { return { mode: mode, focus: focusEl, traps: traps.length, video: video, box: box, panel: panel ? panel.kind : null }; }
+      version: '1.1.0', cfg: CFG, sites: SITES,
+      state: function () {
+        return { mode: mode, site: site ? site.name : null, focus: focusEl, traps: traps.length,
+          video: video, box: box, panel: panel ? panel.kind : null, cands: candidates(currentScope()).length };
+      }
     };
   }
   function boot() {
