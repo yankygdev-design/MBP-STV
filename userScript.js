@@ -34,9 +34,11 @@
     // The site opens at whatever rung it last used, which is often 360p even when a 1080p
     // one is sitting in the menu. Pick the best the TV can actually take, once per title.
     quality: 'high',        // 'high' best rung within the limits below | 'auto' the site's adaptive rung | 'off' leave it alone
-    qualityMax: 1080,       // don't climb past this: a 2017 panel's browser is happiest at 1080p H.264
-    qualityMaxMbps: 14,     // and don't take an original file above this, however it is labelled
-    qualityHevc: false,     // HEVC / AV1 / VP9 in the TV browser is a coin toss, so skip those rungs
+    qualityMax: 2160,       // the ceiling is the panel, and a current Samsung set is 4K
+    qualityMaxMbps: 40,     // a buffering ceiling, not a decoding one: covers any streaming-grade 4K,
+                            // and leaves the remux-sized originals that would stall the link alone
+    qualityNewCodecs: true, // a current set decodes HEVC and AV1 in hardware; false for an older TV,
+                            // where those rungs are a coin toss and H.264 is the safe one
     homeURL: 'https://www.movieboxpro.app/',
     historyURL: '/index/index/history',
     siteRe: /(^|\.)movieboxpro\./i,
@@ -129,7 +131,7 @@
       '.del_close,.mbp-resource-modal-close-btn',
     // Long lists that live inside one panel each, swept only while that panel is open: the
     // language pickers run to a couple of hundred entries, and a style lookup per entry is
-    // exactly what a 2017 TV cannot afford on every keypress.
+    // more than the oldest sets this runs on can afford on every keypress.
     heavy: [
       { when: '.subtitle_translate_con', sel: '.lang_list2 p' },
       { when: '.subtitle_preview_con', sel: '.language_code2 p' },
@@ -1197,9 +1199,9 @@
   function qParse(li, c) {
     var t = li.querySelector(c.title), m = li.querySelector(c.meta);
     var q = { el: li, name: t ? String(t.textContent || '').replace(/\s+/g, ' ') : '',
-      meta: m ? String(m.textContent || '') : '', h: 0, mbps: 0, adaptive: false, odd: false };
+      meta: m ? String(m.textContent || '') : '', h: 0, mbps: 0, adaptive: false, newCodec: false };
     q.adaptive = /adaptive/i.test(q.meta) || /^auto$/i.test(q.name);
-    q.odd = /hevc|h\.?265|av1|vp9/i.test(q.meta);     // codecs this browser may not decode
+    q.newCodec = /hevc|h\.?265|av1|vp9/i.test(q.meta);   // anything past H.264
     // "1920x816" is a scope frame at 1080p: the short side is the one the panel has to push,
     // and using it keeps the rungs in the right order while reading honestly against the cap
     var res = q.meta.match(/(\d{3,5})\s*[x\u00d7]\s*(\d{3,5})/);
@@ -1230,9 +1232,9 @@
     for (i = 0; i < list.length; i++) {
       q = list[i];
       if (q.adaptive || !q.h) continue;                 // nothing here to judge a rung by
-      if (q.h > CFG.qualityMax) continue;               // past what this panel's browser enjoys
+      if (q.h > CFG.qualityMax) continue;               // more than the panel can show
       if (CFG.qualityMaxMbps && q.mbps > CFG.qualityMaxMbps) continue;
-      if (q.odd && !CFG.qualityHevc) continue;
+      if (q.newCodec && !CFG.qualityNewCodecs) continue;
       if (!best || q.h > best.h || (q.h === best.h && q.mbps > best.mbps)) best = q;
     }
     return best;
