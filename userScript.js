@@ -119,14 +119,31 @@
       '.srt_color_set p,.font_opacity_set p,.font_size_set p,.font_family_set p,.bg_color_set p,' +
       '.bg_opacity_set p,#qualityOptions p,.mbp-resource-item,.jian,.jia,.delay_btn,.font_btn,' +
       '.translate_btn,.restart,.next_play,.replay,.close2,.back2,.left_skip,.right_skip,.apply_all,' +
-      '.disable,.vjs-seek-button',
+      '.disable,.vjs-seek-button,.vjs-menu-item,.movie_skip_con .close span,.change2,.lang_select,' +
+      '.del_close,.mbp-resource-modal-close-btn',
+    // Long lists that live inside one panel each, swept only while that panel is open: the
+    // language pickers run to a couple of hundred entries, and a style lookup per entry is
+    // exactly what a 2017 TV cannot afford on every keypress.
+    heavy: [
+      { when: '.subtitle_translate_con', sel: '.lang_list2 p' },
+      { when: '.subtitle_preview_con', sel: '.language_code2 p' },
+      { when: '.subtitle_transcode_con', sel: '.lang_list2 p,.code_list2 li' }
+    ],
     // the player is video.js 8 with the site's own skin, so its controls can be named outright
     // instead of guessed at: far more reliable than matching labels, and it skips the retry loop
     player: {
       subtitles: '.vjs-cc-button',
-      // the quality pill's clickable is the inner control, not the wrapper div
-      settings: '.vjs-source-pill-control,.vjs-player-settings-button',
+      // the settings sheet is the hub - quality, subtitles, speed, autoplay next, skip - so
+      // Green opens that rather than the quality pill, which is one row inside it
+      settings: '.vjs-player-settings-button,.vjs-source-pill-control',
+      episodes: '.vjs-episodes-button',
       next: '.vjs-next-button'
+    },
+    // subtitle sync: the one setting that wants nudging mid-scene, so it gets its own keys
+    delay: {
+      panel: '.subtitle_delay_con',
+      open: '.subtitle_set2 .delay_btn',
+      down: '.jian', up: '.jia', value: '.time', close: '.close2'
     },
     title: '.vjs-mbp-title',   // names the episode on screen, which document.title does not
     episode: mbpEpisode,
@@ -429,6 +446,19 @@
         el = nodes[i];
         if (el.__mbtvCand === stamp || inUI(el)) continue;
         if (tiles && inTile(el, stamp)) continue;
+        if (!laidOut(el)) continue;
+        el.__mbtvCand = stamp; list.push(el);
+      }
+    }
+    // the same, for lists too long to sweep while the panel holding them is shut
+    var heavy = site && site.heavy, hb;
+    for (i = 0; heavy && i < heavy.length; i++) {
+      hb = (scope.matches && scope.matches(heavy[i].when)) ? scope : scope.querySelector(heavy[i].when);
+      if (!hb || !shownQuick(hb)) continue;
+      nodes = hb.querySelectorAll(heavy[i].sel);
+      for (j = 0; j < nodes.length; j++) {
+        el = nodes[j];
+        if (el.__mbtvCand === stamp || inUI(el)) continue;
         if (!laidOut(el)) continue;
         el.__mbtvCand = stamp; list.push(el);
       }
@@ -1141,6 +1171,71 @@
     if (el.tagName === 'A') { var tg = el.getAttribute('target'); if (tg && tg !== '_self') el.setAttribute('target', '_self'); }
     clickEl(el);
   }
+  // ---------------------------------------------------------------- subtitle sync
+  // CH+ / CH- drive the site's own delay control. Inside the player those two keys were a
+  // third name for next/previous episode - Yellow and the media track keys still do that -
+  // so nothing is lost, and the setting that actually needs nudging mid-scene gets a dial
+  // instead of a trip through two menus.
+  var dly = { timer: null };
+  function delayCfg() { return (site && site.delay) || null; }
+  function delayPanel() {
+    var c = delayCfg();
+    if (!c || !box || !attached(box)) return null;
+    var p = box.querySelector(c.panel);
+    if (!p) return null;
+    // measure the panel itself rather than ask shown(): that answer is memoised per scan, and
+    // these keys open the panel and read it back inside one scan generation
+    var r = p.getBoundingClientRect();
+    return (r.width > 2 && r.height > 2 && css(p).visibility !== 'hidden') ? p : null;
+  }
+  function delayText(p) {
+    var c = delayCfg(), v = (c && c.value) ? p.querySelector(c.value) : null;
+    var t = v ? String(v.textContent || '').replace(/\s+/g, '') : '';
+    if (!t) { t = p.getAttribute('data-delay') || ''; if (t) t += 's'; }
+    return t;
+  }
+  function delayStep(p, dir) {
+    var c = delayCfg(), btn = p.querySelector(dir > 0 ? c.up : c.down);
+    if (!btn) { toast('No subtitle-delay control in this player'); return; }
+    clickRaw(btn);
+    // the readout is written by the site's own handler, so read it back after that has run
+    setTimeout(function () {
+      var open = delayPanel(), t = open ? delayText(open) : '';
+      toast('Subtitle delay ' + (t || (dir > 0 ? 'later' : 'earlier')));
+    }, 60);
+    // hold the panel open while the key repeats, then put it away again
+    clearTimeout(dly.timer);
+    dly.timer = setTimeout(hideDelay, 2200);
+  }
+  function hideDelay() {
+    var p = delayPanel(), c = delayCfg();
+    if (!p) return;
+    var x = c.close ? p.querySelector(c.close) : null;
+    if (x) clickRaw(x); else p.style.display = 'none';
+    markDirty();
+  }
+  function subDelay(dir) {
+    var c = delayCfg();
+    if (!c) { episode(dir); return; }     // no adapter for this site: keep the old meaning
+    if (!ensurePlayer()) return;
+    var p = delayPanel();
+    if (p) { delayStep(p, dir); return; }
+    // Not open yet. The delay button sits on the player's subtitle toolbar, which is itself
+    // hidden at TV window sizes; a direct click still runs the site's handler. Should it ever
+    // stop being wired that way, show the panel ourselves rather than swallow the key.
+    var opener = c.open ? box.querySelector(c.open) : null;
+    if (opener) clickRaw(opener);
+    setTimeout(function () {
+      var open = delayPanel();
+      if (!open) {
+        var raw = box.querySelector(c.panel);
+        if (raw) { raw.style.display = 'block'; markDirty(); open = delayPanel(); }
+      }
+      if (open) delayStep(open, dir);
+      else toast('No subtitle-delay control in this player');
+    }, 140);
+  }
+
   function isSeekBar(el) {
     if (!box) return false;
     var wide = rect(el).w > rect(box).w * 0.3;
@@ -1358,9 +1453,11 @@
       case K.RW: seekBy(-1, CFG.seekStepBig, mode === 'controls'); return true;
       case K.STOP: a.pause(); exitWatch(); return true;
       case K.RED: case K.CAPTION: openPlayerMenu(RE_CC, 'subtitles', 'subtitles'); return true;
-      case K.GREEN: openPlayerMenu(RE_SETTINGS, 'quality/settings', 'settings'); return true;
-      case K.YELLOW: case K.NEXT: case K.CHUP: episode(1); return true;
-      case K.PREV: case K.CHDOWN: episode(-1); return true;
+      case K.GREEN: openPlayerMenu(RE_SETTINGS, 'settings', 'settings'); return true;
+      case K.YELLOW: case K.NEXT: episode(1); return true;
+      case K.PREV: episode(-1); return true;
+      case K.CHUP: subDelay(1); return true;
+      case K.CHDOWN: subDelay(-1); return true;
       case K.BLUE: showHelp(); return true;
       default: return false;
     }
@@ -1652,8 +1749,9 @@
       '<div class=\"mbtv-row\"><b>\u25c0 \u25b6</b><span>Skip 10 s (keep pressing for bigger jumps)</span></div>' +
       '<div class=\"mbtv-row\"><b>\u25b2 \u25bc</b><span>The player\'s own controls (subtitles, sync, quality)</span></div>' +
       '<div class=\"mbtv-row\"><b>FF / RW</b><span>Skip 30 s</span></div>' +
-      '<div class=\"mbtv-row\"><b>Red / Green</b><span>Subtitles menu / Quality and settings</span></div>' +
-      '<div class=\"mbtv-row\"><b>Yellow, CH+ / CH\u2212</b><span>Next / previous episode</span></div>' +
+      '<div class=\"mbtv-row\"><b>Red / Green</b><span>Subtitle list / Settings sheet</span></div>' +
+      '<div class=\"mbtv-row\"><b>Yellow, \u23ed \u23ee</b><span>Next / previous episode</span></div>' +
+      '<div class=\"mbtv-row\"><b>CH+ / CH\u2212</b><span>Subtitle sync later / earlier</span></div>' +
       '<div class=\"mbtv-row\"><b>Back</b><span>Close menu, hide controls, leave full screen</span></div>';
     var browse = '<h3>Browsing</h3>' +
       '<div class=\"mbtv-row\"><b>\u25c0 \u25b2 \u25bc \u25b6, OK</b><span>Move and select</span></div>' +
