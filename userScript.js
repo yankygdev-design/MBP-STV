@@ -1316,17 +1316,40 @@
   // third name for next/previous episode - Yellow and the media track keys still do that -
   // so nothing is lost, and the setting that actually needs nudging mid-scene gets a dial
   // instead of a trip through two menus.
-  var dly = { timer: null };
+  var dly = { timer: null, verify: null, forced: [] };
   function delayCfg() { return (site && site.delay) || null; }
-  function delayPanel() {
-    var c = delayCfg();
-    if (!c || !box || !attached(box)) return null;
-    var p = box.querySelector(c.panel);
-    if (!p) return null;
-    // measure the panel itself rather than ask shown(): that answer is memoised per scan, and
-    // these keys open the panel and read it back inside one scan generation
-    var r = p.getBoundingClientRect();
-    return (r.width > 2 && r.height > 2 && css(p).visibility !== 'hidden') ? p : null;
+  // Every delay panel the player has that is measurably on screen, in document order.
+  // querySelector would see only the first, so a player that keeps a second copy of the
+  // readout - or moves it - would leave the visible one up with nothing ever closing it.
+  function delayPanels() {
+    var c = delayCfg(), out = [], list, i, p, r;
+    if (!c || !box || !attached(box)) return out;
+    list = box.querySelectorAll(c.panel);
+    for (i = 0; i < list.length; i++) {
+      p = list[i];
+      // measure the panel itself rather than ask shown(): that answer is memoised per scan,
+      // and these keys open the panel and read it back inside one scan generation
+      r = p.getBoundingClientRect();
+      if (r.width > 2 && r.height > 2 && css(p).visibility !== 'hidden') out.push(p);
+    }
+    return out;
+  }
+  function delayPanel() { var l = delayPanels(); return l.length ? l[0] : null; }
+  // Last resort when the site's own close button does not close it. !important, because a
+  // stylesheet rule carrying !important is exactly what would defeat a plain inline
+  // display:none - and unforce() hands the element back before we ever reopen it, so the
+  // site's own show() is never left fighting a style of ours.
+  function forceHide(p) {
+    try { p.style.setProperty('display', 'none', 'important'); } catch (e) { p.style.display = 'none'; }
+    if (dly.forced.indexOf(p) < 0) dly.forced.push(p);
+  }
+  function unforce() {
+    var i, p;
+    for (i = 0; i < dly.forced.length; i++) {
+      p = dly.forced[i];
+      try { p.style.removeProperty('display'); } catch (e) { p.style.display = ''; }
+    }
+    dly.forced.length = 0;
   }
   function delayText(p) {
     var c = delayCfg(), v = (c && c.value) ? p.querySelector(c.value) : null;
@@ -1345,19 +1368,38 @@
     }, 60);
     // hold the panel open while the key repeats, then put it away again
     clearTimeout(dly.timer);
+    clearTimeout(dly.verify);
     dly.timer = setTimeout(hideDelay, 2200);
   }
   function hideDelay() {
-    var p = delayPanel(), c = delayCfg();
-    if (!p) return;
-    var x = c.close ? p.querySelector(c.close) : null;
-    if (x) clickRaw(x); else p.style.display = 'none';
+    var list = delayPanels(), c = delayCfg(), i, x, clicked = false;
+    dly.timer = null;
+    if (!c || !list.length) return;
+    for (i = 0; i < list.length; i++) {
+      x = c.close ? list[i].querySelector(c.close) : null;
+      if (x) { clickRaw(x); clicked = true; } else forceHide(list[i]);
+    }
     markDirty();
+    // The close button is the site's own handler and is the right way to put the panel
+    // away, so it stays the first thing we try. But on the set it was seen leaving the
+    // readout sitting over the picture, which means clicking it is not proof: check back
+    // and set display ourselves only on a panel still measurably up. Whether the click
+    // misses, the site re-shows the panel, or a rule with !important beat a plain inline
+    // style, the panel goes away - and none of those guesses has to be the right one.
+    if (!clicked) return;
+    clearTimeout(dly.verify);
+    dly.verify = setTimeout(function () {
+      var still = delayPanels(), j;
+      for (j = 0; j < still.length; j++) forceHide(still[j]);
+      if (still.length) markDirty();
+    }, 360);
   }
   function subDelay(dir) {
     var c = delayCfg();
     if (!c) { episode(dir); return; }     // no adapter for this site: keep the old meaning
     if (!ensurePlayer()) return;
+    clearTimeout(dly.verify);
+    unforce();          // hand back anything we hid last time: the site owns it again
     var p = delayPanel();
     if (p) { delayStep(p, dir); return; }
     // Not open yet. The delay button sits on the player's subtitle toolbar, which is itself
@@ -1657,6 +1699,10 @@
   function dispatchCode(code, e) {
     scanId++;
     lastKey = now();
+    // Any key other than the sync keys means the user has moved on, so take the readout
+    // off the picture now instead of leaving it to run down its own timer. dly.timer is
+    // set only while a nudge is pending, so this costs nothing on any other page.
+    if (dly.timer && code !== K.CHUP && code !== K.CHDOWN) { clearTimeout(dly.timer); hideDelay(); }
     try { return handle(code, e); } catch (err) { log(err); return false; }
   }
   function norm(e) {
@@ -2033,7 +2079,7 @@
       mode = 'idle';
     }
     W.__mbtv = {
-      version: '1.2.0', cfg: CFG, sites: SITES,
+      version: '1.2.1', cfg: CFG, sites: SITES,
       state: function () {
         return { mode: mode, site: site ? site.name : null, focus: focusEl, traps: traps.length,
           video: video, box: box, panel: panel ? panel.kind : null, cands: candidates(currentScope()).length };
