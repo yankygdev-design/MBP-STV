@@ -22,6 +22,9 @@
   'use strict';
 
   var W = window, D = document;
+  // One place, because jsDelivr can serve a stale copy of a branch and the help screen is
+  // the only way to tell from the sofa which build is actually running.
+  var VERSION = '1.2.2';
 
   // ------------------------------------------------------------------ settings
   var CFG = {
@@ -2007,7 +2010,7 @@
       '<div class=\"mbtv-row\"><b>CH+ / CH\u2212</b><span>Page up / down</span></div>' +
       '<div class=\"mbtv-row\"><b>Blue or Info</b><span>This help</span></div>';
     var inPlayer = mode === 'watch' || mode === 'controls';
-    openPanel('Remote controls', [], 'help', '<div class="mbtv-help">' + (inPlayer ? watch + browse : browse + watch) +
+    openPanel('Remote controls   v' + VERSION, [], 'help', '<div class="mbtv-help">' + (inPlayer ? watch + browse : browse + watch) +
       '<div style="margin-top:14px;color:rgba(255,255,255,.55)">Press any key to close</div></div>');
   }
 
@@ -2079,7 +2082,7 @@
       mode = 'idle';
     }
     W.__mbtv = {
-      version: '1.2.1', cfg: CFG, sites: SITES,
+      version: VERSION, cfg: CFG, sites: SITES,
       state: function () {
         return { mode: mode, site: site ? site.name : null, focus: focusEl, traps: traps.length,
           video: video, box: box, panel: panel ? panel.kind : null, cands: candidates(currentScope()).length };
