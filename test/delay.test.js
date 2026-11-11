@@ -23,12 +23,15 @@ function El(cls, opts) {
   // test: removing our inline style must hand the element back to the site's own state.
   this.base = opts.visible !== false;
   this._style = {};
+  this._attrs = {};
   var self = this;
   this.style = {
     get display() { return self._style.display || ''; },
     set display(v) { self._style.display = v; self._style._prio = ''; },
     setProperty: function (k, v, prio) { self._style[k] = v; self._style._prio = prio || ''; },
-    removeProperty: function (k) { delete self._style[k]; self._style._prio = ''; }
+    removeProperty: function (k) { delete self._style[k]; self._style._prio = ''; },
+    getPropertyValue: function (k) { return self._style[k] || ''; },
+    getPropertyPriority: function (k) { return k === 'display' ? (self._style._prio || '') : ''; }
   };
 }
 Object.defineProperty(El.prototype, 'visible', {
@@ -53,7 +56,12 @@ El.prototype.querySelector = function (sel) { var l = this.querySelectorAll(sel)
 El.prototype.getBoundingClientRect = function () {
   return this.visible ? { width: 300, height: 90 } : { width: 0, height: 0 };
 };
-El.prototype.getAttribute = function () { return null; };
+El.prototype.getAttribute = function (k) {
+  return Object.prototype.hasOwnProperty.call(this._attrs, k) ? this._attrs[k] : null;
+};
+El.prototype.setAttribute = function (k, v) { this._attrs[k] = String(v); };
+El.prototype.hasAttribute = function (k) { return Object.prototype.hasOwnProperty.call(this._attrs, k); };
+El.prototype.removeAttribute = function (k) { delete this._attrs[k]; };
 El.prototype.click = function () { this.handlers.forEach(function (h) { h(); }); };
 El.prototype.forcedImportant = function () { return this._style.display === 'none' && this._style._prio === 'important'; };
 
@@ -94,7 +102,7 @@ function load(env) {
 var toasts = [];
 function envFor(world) {
   return {
-    site: { delay: { panel: '.subtitle_delay_con', open: '.subtitle_set2 .delay_btn', down: '.jian', up: '.jia', value: '.time', close: '.close2' } },
+    site: { delay: { panel: '.subtitle_delay_con', open: '.subtitle_set2 .delay_btn', sheet: '.subtitle_set2', down: '.jian', up: '.jia', value: '.time', close: '.close2' } },
     box: world.box,
     attached: function () { return true; },
     css: function () { return { visibility: 'visible' }; },
@@ -177,6 +185,59 @@ console.log('case 5  the key repeats');
   check('a new one is armed', api.dly.timer !== first && !api.dly.timer.dead);
   runClock();
   check('panel still ends up gone', api.delayPanel() === null);
+})();
+
+// 6. Handing the element back must restore the site's OWN inline style, not delete it.
+//    Deleting it was a real bug: a panel the site had set inline would come back governed
+//    by a stylesheet it was never governed by, which is one way a bar appears unasked.
+console.log("case 6  the site's own inline style survives a round trip");
+(function () {
+  clock = [];
+  var w = build('dead', 1), api = load(envFor(w)), p = w.panels[0];
+  p.style.display = 'block';                       // the site opened it, inline
+  api.delayStep(p, 1);
+  runClock();
+  check('hidden while we hold it', api.delayPanel() === null);
+  api.unforce();
+  check("the site's inline display:block is back", p.style.display === 'block', 'got "' + p.style.display + '"');
+  check('and our bookkeeping attribute is gone', p.getAttribute('data-mbtv-dsp') === null);
+
+  // and an element with no inline display must end up with none, not an empty string left over
+  clock = [];
+  var w2 = build('dead', 1), api2 = load(envFor(w2)), q = w2.panels[0];
+  check('starts with no inline display', q.style.display === '');
+  api2.delayStep(q, 1);
+  runClock();
+  api2.unforce();
+  check('ends with no inline display either', q.style.display === '', 'got "' + q.style.display + '"');
+})();
+
+// 7. The toolbar the delay button lives on: ours to put away, or the viewer's to keep.
+console.log('case 7  the subtitle toolbar');
+(function () {
+  clock = [];
+  var w = build('dead', 1);
+  var sheet = w.box.add(new El('subtitle_set2', { visible: false }));
+  sheet.add(new El('delay_btn'));
+  var api = load(envFor(w));
+  w.panels[0].base = false;                        // nothing open yet
+  api.subDelay(1);                                 // this is what reveals the toolbar
+  sheet.base = true;                               // the site brings it up, as on the set
+  w.panels[0].base = true;
+  runClock();
+  check('the toolbar we revealed is put away', sheet.visible === false, 'visible=' + sheet.visible);
+
+  // now the other way round: it was already on screen, so it is not ours to hide
+  clock = [];
+  var w2 = build('dead', 1);
+  var sheet2 = w2.box.add(new El('subtitle_set2'));
+  sheet2.add(new El('delay_btn'));
+  var api2 = load(envFor(w2));
+  w2.panels[0].base = false;
+  api2.subDelay(1);
+  w2.panels[0].base = true;
+  runClock();
+  check('a toolbar that was already up is left alone', sheet2.visible === true, 'visible=' + sheet2.visible);
 })();
 
 console.log(fails ? '\n' + fails + ' FAILED' : '\nall passed');

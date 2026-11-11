@@ -24,7 +24,7 @@
   var W = window, D = document;
   // One place, because jsDelivr can serve a stale copy of a branch and the help screen is
   // the only way to tell from the sofa which build is actually running.
-  var VERSION = '1.6.0';
+  var VERSION = '1.7.0';
 
   // ------------------------------------------------------------------ settings
   var CFG = {
@@ -155,7 +155,13 @@
       // carrying a jQuery handler - no href, no onclick, no cursor:pointer - so every other
       // pass here misses it and the Google link is the only thing on the page you can reach.
       // The img, not the <p>: the handler is bound to the image, and the <p> spans the row.
-      '.login_more img',
+      '.login_more img,' +
+      // A title's own page: the button that starts it. The code elsewhere already reads
+      // `.play_btn[play]` and `.start_app[play]` to work out what is playing, so these are
+      // certainly the right elements - they were simply never harvested, which left the one
+      // control the page exists for unreachable by remote. The episode rows are anchors but
+      // carry no href, so they need naming here too.
+      '.play_btn,.start_app,.start_app_episode',
     // Long lists that live inside one panel each, swept only while that panel is open: the
     // language pickers run to a couple of hundred entries, and a style lookup per entry is
     // more than the oldest sets this runs on can afford on every keypress.
@@ -188,6 +194,10 @@
     delay: {
       panel: '.subtitle_delay_con',
       open: '.subtitle_set2 .delay_btn',
+      // The toolbar that button lives on. Reaching the delay button can bring the whole
+      // toolbar on screen, and it then sits over the picture with its own rows soaking up
+      // D-pad stops. We put back whatever we disturbed, and only that.
+      sheet: '.subtitle_set2',
       down: '.jian', up: '.jia', value: '.time', close: '.close2'
     },
     title: '.vjs-mbp-title',   // names the episode on screen, which document.title does not
@@ -1384,17 +1394,43 @@
   // stylesheet rule carrying !important is exactly what would defeat a plain inline
   // display:none - and unforce() hands the element back before we ever reopen it, so the
   // site's own show() is never left fighting a style of ours.
+  // Write down what was there before touching it. removeProperty on the way back would
+  // also wipe an inline display the site itself had set, handing the element back in a
+  // state it was never in - and for a panel the site keeps hidden inline, that means
+  // revealing it.
+  var DSP = 'data-mbtv-dsp';
   function forceHide(p) {
-    try { p.style.setProperty('display', 'none', 'important'); } catch (e) { p.style.display = 'none'; }
+    try {
+      if (!p.hasAttribute(DSP)) {
+        p.setAttribute(DSP, p.style.getPropertyValue('display') + '|' + p.style.getPropertyPriority('display'));
+      }
+      p.style.setProperty('display', 'none', 'important');
+    } catch (e) { try { p.style.display = 'none'; } catch (e2) {} }
     if (dly.forced.indexOf(p) < 0) dly.forced.push(p);
   }
   function unforce() {
-    var i, p;
+    var i, p, was, bar;
     for (i = 0; i < dly.forced.length; i++) {
       p = dly.forced[i];
-      try { p.style.removeProperty('display'); } catch (e) { p.style.display = ''; }
+      try {
+        was = p.getAttribute(DSP);
+        bar = was === null ? -1 : was.indexOf('|');
+        if (bar > 0) p.style.setProperty('display', was.slice(0, bar), was.slice(bar + 1));
+        else p.style.removeProperty('display');
+        p.removeAttribute(DSP);
+      } catch (e) {}
     }
     dly.forced.length = 0;
+  }
+  // The toolbar, hidden again only if opening the delay panel is what brought it up.
+  function sheetEl() {
+    var c = delayCfg();
+    return (c && c.sheet && box && attached(box)) ? box.querySelector(c.sheet) : null;
+  }
+  function visible(el) {
+    if (!el) return false;
+    var r = el.getBoundingClientRect();
+    return r.width > 2 && r.height > 2 && css(el).visibility !== 'hidden';
   }
   function delayText(p) {
     var c = delayCfg(), v = (c && c.value) ? p.querySelector(c.value) : null;
@@ -1431,13 +1467,20 @@
     // and set display ourselves only on a panel still measurably up. Whether the click
     // misses, the site re-shows the panel, or a rule with !important beat a plain inline
     // style, the panel goes away - and none of those guesses has to be the right one.
+    hideSheet();
     if (!clicked) return;
     clearTimeout(dly.verify);
     dly.verify = setTimeout(function () {
       var still = delayPanels(), j;
       for (j = 0; j < still.length; j++) forceHide(still[j]);
+      hideSheet();
       if (still.length) markDirty();
     }, 360);
+  }
+  function hideSheet() {
+    if (dly.sheetWasUp) return;       // it was on screen before we touched anything
+    var sh = sheetEl();
+    if (visible(sh)) { forceHide(sh); markDirty(); }
   }
   function subDelay(dir) {
     var c = delayCfg();
@@ -1451,6 +1494,8 @@
     // hidden at TV window sizes; a direct click still runs the site's handler. Should it ever
     // stop being wired that way, show the panel ourselves rather than swallow the key.
     var opener = c.open ? box.querySelector(c.open) : null;
+    var sh = sheetEl();
+    dly.sheetWasUp = visible(sh);     // if it was already up, it is the viewer's, not ours
     if (opener) clickRaw(opener);
     setTimeout(function () {
       var open = delayPanel();
@@ -2044,10 +2089,34 @@
   // catalogue still looks small while root reads the scaled value, the catalogue is not
   // sized in rem and no amount of root font-size will touch it - which is worth knowing
   // before writing any more code against it.
+  // The page scale reaches the sign-in page and not the catalogue, and the cause cannot be
+  // read from here: the catalogue is behind the login. So report the three things that tell
+  // them apart. If root is the scaled value and the page still looks small, the catalogue
+  // is not sized in rem and a root font-size will never touch it. If a wrapper is still
+  // about 750px wide, it is pinned in px and that wrapper is the thing to override - which
+  // is why its selector is named rather than just its width.
+  function pinnedWrap() {
+    var all, i, el, w, best = null, bw = 0;
+    try { all = D.body ? D.body.querySelectorAll('div,main,section') : []; } catch (e) { return 'none'; }
+    for (i = 0; i < all.length && i < 400; i++) {
+      el = all[i];
+      w = el.getBoundingClientRect().width;
+      // a wrapper pinned to the phone canvas on a screen at least a third wider again
+      if (w > 600 && w < 900 && w < W.innerWidth * 0.75 && w > bw) { bw = w; best = el; }
+    }
+    if (!best) return 'none';
+    return (best.tagName || '?').toLowerCase() +
+      (best.className && typeof best.className === 'string' ? '.' + best.className.split(/\s+/)[0] : '') +
+      ' ' + Math.round(bw) + 'px';
+  }
   function diagText() {
-    var root = 0;
+    var root = 0, bodyF = 0, bodyW = 0;
     try { root = parseFloat(css(D.documentElement).fontSize) || 0; } catch (e) {}
-    return W.innerWidth + '\u00d7' + W.innerHeight + ' viewport \u00b7 root ' + Math.round(root) + 'px' +
+    try { bodyF = parseFloat(css(D.body).fontSize) || 0; } catch (e) {}
+    try { bodyW = Math.round(D.body.getBoundingClientRect().width); } catch (e) {}
+    return W.innerWidth + '\u00d7' + W.innerHeight + ' viewport \u00b7 ' + (IS_TOP ? 'top' : 'in a frame') +
+      ' \u00b7 root ' + Math.round(root) + 'px \u00b7 body ' + bodyW + 'px/' + Math.round(bodyF) + 'px' +
+      ' \u00b7 pinned ' + pinnedWrap() +
       ' \u00b7 size ' + Math.round(scaleGet() * 100) + '%' +
       ' \u00b7 max ' + (qMaxGet() ? qMaxGet() + 'p' : 'off') +
       ' \u00b7 HEVC/AV1 ' + (qCodecsGet() ? 'on' : 'off');
