@@ -24,7 +24,11 @@
   var W = window, D = document;
   // One place, because jsDelivr can serve a stale copy of a branch and the help screen is
   // the only way to tell from the sofa which build is actually running.
-  var VERSION = '1.7.0';
+  var VERSION = '1.8.0';
+  // The viewport as the page was first handed it, read before anything here changes it.
+  // Every later width is derived from this rather than from the current innerWidth, which
+  // we are about to start moving.
+  var BASE_W = 0;
 
   // ------------------------------------------------------------------ settings
   var CFG = {
@@ -1992,16 +1996,57 @@
   // up taller than a TV screen and has to be scrolled. That is inherent in honouring a
   // portrait design on a landscape panel rather than a fault here, and it is the reason this
   // is adjustable at all: Red, then Screen size, then Left and Right.
-  var SCALE_KEY = 'mbtv_scale', SCALE_MIN = 0.4, SCALE_MAX = 1.4, scaleEl = null;
+  var SCALE_KEY = 'mbtv_scale', SCALE_MIN = 0.5, SCALE_MAX = 2.5, scaleEl = null, vpEl = null;
   function scaleClamp(v) { return Math.max(SCALE_MIN, Math.min(SCALE_MAX, Math.round(v * 20) / 20)); }
   function scaleGet() {
     var v = NaN;
     try { v = parseFloat(W.localStorage.getItem(SCALE_KEY)); } catch (e) {}
     return scaleClamp(v > 0 ? v : 1);          // 1 means the design filling the screen width
   }
+  // Asking the engine for a narrower viewport is the whole trick, and it is worth saying
+  // why rather than reaching for zoom or a transform.
+  //
+  // The sign-in page is the 750px phone design, sized in rem, so a root font-size moves it.
+  // The catalogue is not: a photograph of the help screen on the real set reported root at
+  // 256px while the catalogue still rendered small, which is proof that the catalogue is
+  // the site's desktop layout, laid out in px. No root font-size will ever touch it.
+  //
+  // CSS zoom and a transform both magnify px layouts, and both put every coordinate in this
+  // file into a second space: the focus ring, the scroll-into-view maths and the hit test
+  // behind a synthetic click would each need correcting, differently on different Chromium
+  // versions, with no TV here to check against. A viewport width costs none of that. The
+  // engine lays the page out in fewer CSS pixels and scales the result to the panel, so
+  // innerWidth genuinely becomes the smaller number and every measurement in this file
+  // stays true without a line of new arithmetic.
+  //
+  // If the TV's engine ignores the tag - a desktop-class Chromium does - nothing changes
+  // and nothing breaks. The help screen prints innerWidth, so one look says which happened.
+  function vpApply() {
+    var f = scaleGet();
+    if (!BASE_W) return;
+    if (f === 1) {                             // 100% is the page exactly as the site ships it
+      if (attached(vpEl)) { vpEl.parentNode.removeChild(vpEl); vpEl = null; markDirty(); }
+      return;
+    }
+    var w = Math.round(BASE_W / f);
+    if (!(w > 240)) return;
+    if (!attached(vpEl)) {
+      vpEl = D.createElement('meta');
+      vpEl.setAttribute('name', 'viewport');
+      vpEl.setAttribute('data-mbtv', 'viewport');
+      (D.head || D.documentElement).appendChild(vpEl);   // last one wins, so ours does
+    }
+    var want = 'width=' + w + ',initial-scale=' + (BASE_W / w).toFixed(3);
+    if (vpEl.getAttribute('content') !== want) { vpEl.setAttribute('content', want); markDirty(); }
+  }
   function scaleApply() {
     if (!CFG.pageScale || !onSite()) return;
-    var px = (W.innerWidth / 7.5) * scaleGet();
+    if (!BASE_W) BASE_W = W.innerWidth;
+    vpApply();
+    // The rem layouts still need the site's own 750px cap lifted. No user factor here: the
+    // viewport above already carries it, and applying it twice would scale rem pages by the
+    // square of what the menu says.
+    var px = W.innerWidth / 7.5;
     if (!(px > 0)) return;                     // a zero-width viewport: leave the site alone
     if (!attached(scaleEl)) {
       scaleEl = D.createElement('style');
@@ -2015,6 +2060,7 @@
     var v = scaleClamp(scaleGet() + dir * 0.1);
     try { W.localStorage.setItem(SCALE_KEY, String(v)); } catch (e) {}
     scaleApply();
+    markDirty(); drawRingSoon();      // everything just moved: re-measure before the next key
     return v;
   }
   function scaleLabel() { return 'Screen size  ' + Math.round(scaleGet() * 100) + '%   \u25c0 \u25b6'; }
@@ -2102,7 +2148,7 @@
       el = all[i];
       w = el.getBoundingClientRect().width;
       // a wrapper pinned to the phone canvas on a screen at least a third wider again
-      if (w > 600 && w < 900 && w < W.innerWidth * 0.75 && w > bw) { bw = w; best = el; }
+      if (w > 400 && w < W.innerWidth * 0.92 && w > bw) { bw = w; best = el; }
     }
     if (!best) return 'none';
     return (best.tagName || '?').toLowerCase() +
