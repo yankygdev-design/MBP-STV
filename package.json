@@ -1,7 +1,7 @@
 {
   "name": "movieboxpro-tv",
   "appName": "MovieBox Pro TV",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "MovieBoxPro with the TV remote: D-pad catalog browsing and full-screen playback that drives the site's own player, so subtitles, subtitle sync and quality keep working.",
   "packageType": "mods",
   "websiteURL": "https://www.movieboxpro.app/",
@@ -26,6 +26,6 @@
   ],
   "license": "MIT",
   "scripts": {
-    "test": "node test/delay.test.js"
+    "test": "node test/delay.test.js && node test/quality.test.js"
   }
 }

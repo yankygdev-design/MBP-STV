@@ -24,7 +24,7 @@
   var W = window, D = document;
   // One place, because jsDelivr can serve a stale copy of a branch and the help screen is
   // the only way to tell from the sofa which build is actually running.
-  var VERSION = '1.2.2';
+  var VERSION = '1.6.0';
 
   // ------------------------------------------------------------------ settings
   var CFG = {
@@ -37,11 +37,17 @@
     // The site opens at whatever rung it last used, which is often 360p even when a 1080p
     // one is sitting in the menu. Pick the best the TV can actually take, once per title.
     quality: 'high',        // 'high' best rung within the limits below | 'auto' the site's adaptive rung | 'off' leave it alone
-    qualityMax: 2160,       // the ceiling is the panel, and a current Samsung set is 4K
+    // These two were 2160 and true, which was a guess about the panel dressed up as a
+    // setting. On the first real run it wedged playback: the film started, the climb to a
+    // 4K rung landed about a second later, and the player sat buffering for good. Nothing
+    // here has ever measured what this set decodes through a browser, and a guess that can
+    // strand a film is worse than a rung that definitely plays. 1080p H.264 is the rung no
+    // Samsung set of this generation struggles with; the Red menu climbs from there, which
+    // is also how we find out what the ceiling really is.
+    qualityMax: 1080,       // default ceiling; Red > Max quality overrides and persists
     qualityMaxMbps: 40,     // a buffering ceiling, not a decoding one: covers any streaming-grade 4K,
                             // and leaves the remux-sized originals that would stall the link alone
-    qualityNewCodecs: true, // a current set decodes HEVC and AV1 in hardware; false for an older TV,
-                            // where those rungs are a coin toss and H.264 is the safe one
+    qualityNewCodecs: false,// HEVC and AV1 unproven on this panel through a browser; Red turns them on
     homeURL: 'https://www.movieboxpro.app/',
     historyURL: '/index/index/history',
     siteRe: /(^|\.)movieboxpro\./i,
@@ -1225,8 +1231,41 @@
   // Left alone, the site reopens at whatever rung it used last, and that is frequently 360p
   // on a film that has a 1080p rung ready. This reads the menu once per title and moves up
   // if it can. It only ever moves up: a rung the viewer picked by hand is never overridden.
-  var qd = { done: '', tries: 0, timer: null };
+  var qd = { done: '', tries: 0, timer: null, force: false };
   function qCfg() { return (site && site.quality) || null; }
+  // The ceiling and the codec gate live in localStorage, not just CFG, because the only way
+  // to find out what this panel really decodes is to climb it from the sofa and watch. 0 is
+  // off: leave whatever rung the site opened with, which is the escape hatch when a rung
+  // has stranded the player.
+  var QMAX_KEY = 'mbtv_qmax', QNEW_KEY = 'mbtv_qnew', QMAX_STEPS = [0, 720, 1080, 1440, 2160];
+  function lsGet(k) { try { return W.localStorage.getItem(k); } catch (e) { return null; } }
+  function lsSet(k, v) { try { W.localStorage.setItem(k, String(v)); } catch (e) {} }
+  function qMaxGet() {
+    var v = parseInt(lsGet(QMAX_KEY), 10);
+    if (isNaN(v)) return CFG.qualityMax;
+    for (var i = 0; i < QMAX_STEPS.length; i++) if (QMAX_STEPS[i] === v) return v;
+    return CFG.qualityMax;                      // a value we did not write: ignore it
+  }
+  function qCodecsGet() {
+    var v = lsGet(QNEW_KEY);
+    return v === null ? !!CFG.qualityNewCodecs : v === '1';
+  }
+  // A deliberate change means try again on the title already playing, and it is the one
+  // case where stepping *down* is allowed - that is what makes this a way out of a stall.
+  function qAgain() { qd.done = ''; qd.force = true; qSoon(); }
+  function qMaxNudge(dir) {
+    var cur = qMaxGet(), i = 0, j;
+    for (j = 0; j < QMAX_STEPS.length; j++) if (QMAX_STEPS[j] === cur) i = j;
+    i = Math.max(0, Math.min(QMAX_STEPS.length - 1, i + dir));
+    lsSet(QMAX_KEY, QMAX_STEPS[i]);
+    qAgain();
+  }
+  function qCodecsToggle() { lsSet(QNEW_KEY, qCodecsGet() ? '0' : '1'); qAgain(); }
+  function qMaxLabel() {
+    var v = qMaxGet();
+    return 'Max quality  ' + (v ? v + 'p' : 'off (leave the site alone)') + '   \u25c0 \u25b6';
+  }
+  function qCodecsLabel() { return 'HEVC and AV1  ' + (qCodecsGet() ? 'on' : 'off') + '   \u25c0 \u25b6'; }
   function qParse(li, c) {
     var t = li.querySelector(c.title), m = li.querySelector(c.meta);
     var q = { el: li, name: t ? String(t.textContent || '').replace(/\s+/g, ' ') : '',
@@ -1263,9 +1302,9 @@
     for (i = 0; i < list.length; i++) {
       q = list[i];
       if (q.adaptive || !q.h) continue;                 // nothing here to judge a rung by
-      if (q.h > CFG.qualityMax) continue;               // more than the panel can show
+      if (q.h > qMaxGet()) continue;                    // more than we have proved it can show
       if (CFG.qualityMaxMbps && q.mbps > CFG.qualityMaxMbps) continue;
-      if (q.newCodec && !CFG.qualityNewCodecs) continue;
+      if (q.newCodec && !qCodecsGet()) continue;
       if (!best || q.h > best.h || (q.h === best.h && q.mbps > best.mbps)) best = q;
     }
     return best;
@@ -1283,7 +1322,7 @@
   }
   function applyQuality() {
     var c = qCfg();
-    if (!c || CFG.quality === 'off' || !ensurePlayer()) return;
+    if (!c || CFG.quality === 'off' || !qMaxGet() || !ensurePlayer()) return;
     var key = qKey();
     if (qd.done === key) return;
     var list = qList(), i, cur = null;
@@ -1294,9 +1333,12 @@
     qd.tries = 0;
     for (i = 0; i < list.length; i++) if (qPicked(list[i])) cur = list[i];
     var best = qBest(list);
+    var forced = qd.force; qd.force = false;
     qd.done = key;            // whatever happens next, don't come back at this title again
     if (!best || (cur && cur.el === best.el)) return;
-    if (cur && !cur.adaptive && cur.h >= best.h) return;   // never step down behind the viewer
+    // Never step down behind the viewer - unless the viewer just lowered the ceiling from
+    // the menu, which is how a rung this panel cannot decode gets undone without a restart.
+    if (cur && !cur.adaptive && cur.h >= best.h && !forced) return;
     log('quality ' + (cur ? cur.name : '?') + ' -> ' + best.name + ' (' + best.meta + ')');
     toast('Quality \u2192 ' + best.name);
     clickRaw(best.el);
@@ -1978,6 +2020,10 @@
     }
     return true;
   }
+  // A row the user is adjusting has to show its new value without the panel closing.
+  function relabel(fn) {
+    if (panel && panel.items[panel.idx]) { panel.items[panel.idx].label = fn(); renderPanel(); }
+  }
   function openQuick(atRoot) {
     var items = [], site = onSite();
     for (var i = 0; i < CFG.quick.length; i++) (function (q) {
@@ -1986,11 +2032,25 @@
     })(CFG.quick[i]);
     if (site && CFG.pageScale) items.push({ label: scaleLabel(), step: function (d) {
       scaleNudge(d);
-      if (panel && panel.items[panel.idx]) { panel.items[panel.idx].label = scaleLabel(); renderPanel(); }
+      relabel(scaleLabel);
     } });
+    items.push({ label: qMaxLabel(), step: function (d) { qMaxNudge(d); relabel(qMaxLabel); } });
+    items.push({ label: qCodecsLabel(), step: function () { qCodecsToggle(); relabel(qCodecsLabel); } });
     items.push({ label: 'Remote help', run: showHelp });
     items.push({ label: 'Exit', run: exitApp });
     openPanel(atRoot ? 'Nothing more to go back to' : 'Menu', items, 'menu');
+  }
+  // What the set actually reports, so a report from the sofa is a measurement. If the
+  // catalogue still looks small while root reads the scaled value, the catalogue is not
+  // sized in rem and no amount of root font-size will touch it - which is worth knowing
+  // before writing any more code against it.
+  function diagText() {
+    var root = 0;
+    try { root = parseFloat(css(D.documentElement).fontSize) || 0; } catch (e) {}
+    return W.innerWidth + '\u00d7' + W.innerHeight + ' viewport \u00b7 root ' + Math.round(root) + 'px' +
+      ' \u00b7 size ' + Math.round(scaleGet() * 100) + '%' +
+      ' \u00b7 max ' + (qMaxGet() ? qMaxGet() + 'p' : 'off') +
+      ' \u00b7 HEVC/AV1 ' + (qCodecsGet() ? 'on' : 'off');
   }
   function showHelp() {
     var watch = '<h3>Watching</h3>' +
@@ -2008,7 +2068,8 @@
       '<div class=\"mbtv-row\"><b>Red</b><span>Menu (home, history, favorites, sign in, screen size)</span></div>' +
       '<div class=\"mbtv-row\"><b>Green / Yellow</b><span>Search / History</span></div>' +
       '<div class=\"mbtv-row\"><b>CH+ / CH\u2212</b><span>Page up / down</span></div>' +
-      '<div class=\"mbtv-row\"><b>Blue or Info</b><span>This help</span></div>';
+      '<div class=\"mbtv-row\"><b>Blue or Info</b><span>This help</span></div>' +
+      '<h3>Measured here</h3><div class=\"mbtv-row\"><b></b><span>' + diagText() + '</span></div>';
     var inPlayer = mode === 'watch' || mode === 'controls';
     openPanel('Remote controls   v' + VERSION, [], 'help', '<div class="mbtv-help">' + (inPlayer ? watch + browse : browse + watch) +
       '<div style="margin-top:14px;color:rgba(255,255,255,.55)">Press any key to close</div></div>');
@@ -2064,7 +2125,16 @@
     W.addEventListener('pageshow', function () { leaving = false; markDirty(); drawRing(); }, false);
     observe();
     // the ring also follows scrolling and resizes: this is only a safety net for layout we miss
-    setInterval(function () { if (!D.hidden && focusEl) drawRing(); }, 600);
+    // The scale was applied once at start and on resize, which is not enough: the site
+    // renders pages into the same document, and a page that replaces the head takes the
+    // rule with it - the login page kept it, the catalogue did not. Re-assert it on the
+    // tick that is already running. scaleApply compares its own text first, so a tick
+    // where nothing changed costs a string compare and touches no DOM.
+    setInterval(function () {
+      if (D.hidden) return;
+      scaleApply();
+      if (focusEl) drawRing();
+    }, 600);
     registerKeys();
     if (IS_TOP) {
       patchOpen();
