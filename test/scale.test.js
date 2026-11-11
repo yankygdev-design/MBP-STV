@@ -119,11 +119,35 @@ console.log('case 3  the factor is applied once, not twice');
   store['mbtv_scale'] = '1.4';
   var api = load();
   api.scaleApply();
-  check('root is innerWidth/7.5 with no factor', /font-size:256\.00px/.test(styleText()), styleText());
-  // and once the engine honours the tag, innerWidth really is the smaller number
+  check('root is the base width / 7.5, with no factor', /font-size:256\.00px/.test(styleText()), styleText());
+  // Once the engine honours the tag, innerWidth really is the smaller number - and the root
+  // must NOT follow it down. This assertion used to say the opposite, which locked in a bug:
+  // 183 CSS px at an initial-scale of 1.4 is the same 256 physical pixels as before, so every
+  // rem declaration in the sheet would have sat still while the px boxes around it grew.
   win.innerWidth = 1371;
   api.scaleApply();
-  check('and follows the viewport down', /font-size:182\.80px/.test(styleText()), styleText());
+  check('and does not follow the viewport down', /font-size:256\.00px/.test(styleText()), styleText());
+})();
+
+// 3b. The property that matters, stated directly: a rem box and a px box must come out of
+//     the same magnification with the same ratio between them as they started.
+console.log('case 3b  rem and px grow together');
+(function () {
+  reset();
+  var api = load();
+  api.scaleApply();                                  // 100%: establishes the baseline
+  var root100 = parseFloat(styleText().match(/font-size:([\d.]+)px/)[1]);
+  store['mbtv_scale'] = '1.4';
+  api.scaleApply();
+  var m = meta(), zoom = parseFloat(m.getAttribute('content').match(/initial-scale=([\d.]+)/)[1]);
+  win.innerWidth = Math.round(1920 / 1.4);           // the engine honours it
+  api.scaleApply();
+  var root140 = parseFloat(styleText().match(/font-size:([\d.]+)px/)[1]);
+  // a px box of 100 CSS px, and a rem box of 1rem, both in physical pixels
+  var pxBefore = 100 * 1, pxAfter = 100 * zoom;
+  var remBefore = root100 * 1, remAfter = root140 * zoom;
+  check('the px box grew by the zoom', Math.abs(pxAfter / pxBefore - 1.4) < 0.01, (pxAfter / pxBefore).toFixed(3));
+  check('the rem box grew by the same', Math.abs(remAfter / remBefore - 1.4) < 0.01, (remAfter / remBefore).toFixed(3));
 })();
 
 // 4. Coming back to 100% has to remove the tag, not leave a stale one.

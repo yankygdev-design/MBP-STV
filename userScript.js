@@ -24,7 +24,7 @@
   var W = window, D = document;
   // One place, because jsDelivr can serve a stale copy of a branch and the help screen is
   // the only way to tell from the sofa which build is actually running.
-  var VERSION = '1.8.0';
+  var VERSION = '1.8.1';
   // The viewport as the page was first handed it, read before anything here changes it.
   // Every later width is derived from this rather than from the current innerWidth, which
   // we are about to start moving.
@@ -2043,10 +2043,18 @@
     if (!CFG.pageScale || !onSite()) return;
     if (!BASE_W) BASE_W = W.innerWidth;
     vpApply();
-    // The rem layouts still need the site's own 750px cap lifted. No user factor here: the
-    // viewport above already carries it, and applying it twice would scale rem pages by the
-    // square of what the menu says.
-    var px = W.innerWidth / 7.5;
+    // The rem layouts still need the site's own 750px cap lifted. Measured against BASE_W,
+    // not the current innerWidth, and the difference is the whole behaviour.
+    //
+    // The sheet mixes units unconditionally - 1028 px declarations against 331 rem, with two
+    // media blocks holding 66 bytes between them - so both unit systems appear side by side
+    // in the same boxes. Dividing the *current* innerWidth looked right and cancelled the
+    // magnification for every one of those rem declarations: narrowing the viewport to 1371
+    // dropped the root to 183px, and 183 CSS px at an initial-scale of 1.4 is the same 256
+    // physical pixels it was at 100%. Text would have sat still inside boxes that grew
+    // around it. Against BASE_W the root stays put in CSS pixels and the viewport magnifies
+    // rem and px alike, which is the only way a mixed sheet scales without tearing.
+    var px = BASE_W / 7.5;
     if (!(px > 0)) return;                     // a zero-width viewport: leave the site alone
     if (!attached(scaleEl)) {
       scaleEl = D.createElement('style');
